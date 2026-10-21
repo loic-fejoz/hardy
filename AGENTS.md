@@ -68,6 +68,19 @@ Full conventions: [`docs/style_guides/test_style_guide.md`](./docs/style_guides/
 - **Placement:** public-API tests in the crate's `tests/`; private-internal tests in an inline `#[cfg(test)] mod tests`. No test or fixture file under `src/` (no `src/tests.rs`, no `src/test_util.rs`); shared fixtures live in an inline `#[cfg(test)] pub mod tests` cross-imported by path, or in `tests/common/mod.rs` when shared between integration-test binaries.
 - **No hard-coded cryptographic values, even in tests — no exceptions beyond pinned vectors.** Literal keys/IVs/salts are forbidden, `#[cfg(test)]` included; immaterial values MUST be generated via the crate's own rand helper. A key MAY be hard-coded only when the expected bytes were produced outside the test with that exact key (spec appendix, conformance/PICS vector, interop capture); there is no third case. Agreement on a generated key is explicit (bind once, pass to both paths — never memoize a fixture into a process-global); required distinctness is generated and `assert_ne!`d, never spelled as two magic literals.
 
+## Interoperability testing
+
+Hardy maintains two levels of interoperability tests:
+
+- **In-crate reference tests (Rust, no Docker required):**
+  - Licklider reference engine (RFC 5326): `cargo test -p hardy-ltp --test interop_licklider`
+  - Network impairment channel (loss, jitter, reordering): `cargo test -p hardy-ltp --test impairment_channel`
+- **Docker-based peer implementation tests ([`tests/interop/`](./tests/interop/)):**
+  - Full interop test suite across all peers: `./tests/interop/run_all.sh [--skip-build] [--count N]`
+  - NASA JPL ION via LTP/UDP (RFC 7122): `./tests/interop/ION/test_ion_ltp_ping.sh [--skip-build] [--count N]`
+  - NASA JPL ION via STCP: `./tests/interop/ION/test_ion_ping.sh`
+  - Peer-specific scripts: `./tests/interop/<PEER>/test_<peer>_ping.sh` (`HDTN`, `dtn7-rs`, `DTNME`, `ud3tn`, `ESA-BP`, `NASA-cFS`).
+
 ## Documentation & prose
 
 - Rustdoc on public items follows [`docs/style_guides/rustdoc_style_guide.md`](./docs/style_guides/rustdoc_style_guide.md).

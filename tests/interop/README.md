@@ -14,7 +14,7 @@ Hardy is tested against 7 peer implementations. Each test verifies bidirectional
 | [dtn7-rs](dtn7-rs/) | TCPCLv4 | dtnecho2 (service 7) | Passing | [README](dtn7-rs/README.md) |
 | [HDTN](HDTN/) | TCPCLv4 | Built-in (service 2047) | Passing | [README](HDTN/README.md) |
 | [DTNME](DTNME/) | TCPCLv4 | echo_me (service 7) | Passing | [README](DTNME/README.md) |
-| [ION](ION/) | STCP (via mtcp-cla) | bpecho (service 7) | Passing | [README](ION/README.md) |
+| [ION](ION/) | STCP (via mtcp-cla), LTP/UDP | bpecho (service 7) | Passing | [README](ION/README.md) |
 | [ud3tn](ud3tn/) | MTCP (via mtcp-cla) | AAP2 echo agent (service 7) | Passing | [README](ud3tn/README.md) |
 | [ESA BP](ESA-BP/) | STCP (via mtcp-cla) | STCP CLE + echo (service 7) | Passing | [README](ESA-BP/README.md) |
 | [NASA cFS](NASA-cFS/) | STCP (via mtcp-cla) | SB routing echo (service 7) | Passing | [README](NASA-cFS/README.md) |
@@ -36,6 +36,7 @@ Results are saved to `interop_results.md`.
 ```bash
 ./tests/interop/HDTN/test_hdtn_ping.sh
 ./tests/interop/HDTN/test_hdtn_ping.sh --skip-build --count 10
+./tests/interop/ION/test_ion_ltp_ping.sh     # NASA JPL ION via LTP/UDP
 ```
 
 All test scripts support `--skip-build`, `--refresh` (rebuild the peer's Docker image from scratch), and `--count N`.
