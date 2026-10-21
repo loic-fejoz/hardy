@@ -1,0 +1,44 @@
+# Example LTP Convergence Layer Adapter configuration for hardy-bpa-server
+# This file illustrates both UDP transport (RFC 7122) and KISS-over-TCP framing
+# (packet radio / AX.25 TNC, e.g. Direwolf).
+
+clas:
+  # Standard LTP over UDP datagram transport
+  - name: ltp-udp-1
+    type: ltp
+    engine-id: 100
+    max-segment-payload-len: 1400
+    rtt: "1s"
+    ack-margin: "250ms"
+    checkpoint-rtx-limit: 10
+    report-rtx-limit: 10
+    transport:
+      type: udp
+      bind-addr: "0.0.0.0:1113"
+    peers:
+      - engine-id: 200
+        address: "192.168.1.200:1113"
+        node-id: "ipn:200.0"
+      - engine-id: 300
+        address: "192.168.1.201:1113"
+        node-id: "ipn:300.0"
+
+  # LTP framed over KISS TCP for packet radio / Direwolf TNC
+  - name: ltp-kiss-direwolf
+    type: ltp
+    engine-id: 100
+    max-segment-payload-len: 250
+    rtt: "3s"
+    ack-margin: "1s"
+    checkpoint-rtx-limit: 5
+    report-rtx-limit: 5
+    transport:
+      type: kiss-tcp
+      server-addr: "127.0.0.1:8001"
+      port: 0
+      reconnect-initial-delay: "500ms"
+      reconnect-max-delay: "30s"
+    peers:
+      - engine-id: 50
+        address: "127.0.0.1:8001"
+        node-id: "ipn:50.0"

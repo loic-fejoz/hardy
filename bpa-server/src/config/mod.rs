@@ -876,4 +876,90 @@ admin-endpoints:
             .to_string();
         assert!(err.contains("invalid duration"), "{err}");
     }
+
+    // LTP CLA config parses from YAML with UDP transport and peer mappings.
+    #[test]
+    #[serial]
+    #[cfg(feature = "ltp-cla")]
+    fn ltp_cla_config_udp_parses() {
+        let config = write_and_load(
+            "ltp_udp.yaml",
+            r#"
+clas:
+  - name: ltp-udp
+    type: ltp
+    engine-id: 100
+    transport:
+      type: udp
+      bind-addr: "127.0.0.1:21111"
+    max-segment-payload-len: 1400
+    rtt: "2s"
+    ack-margin: "500ms"
+    checkpoint-rtx-limit: 5
+    report-rtx-limit: 5
+    peers:
+      - engine-id: 200
+        address: "127.0.0.1:21112"
+        node-id: "ipn:200.0"
+"#,
+        );
+        let cla::ClaType::Ltp(ltp) = &config.clas[0].cla_type else {
+            panic!("expected an ltp CLA entry");
+        };
+        assert_eq!(ltp.engine_id, hardy_ltp_cla::EngineId(100));
+        match &ltp.transport {
+            hardy_ltp_cla::TransportMode::Udp { bind_addr } => {
+                assert_eq!(bind_addr.to_string(), "127.0.0.1:21111");
+            }
+            _ => panic!("expected UDP transport"),
+        }
+        assert_eq!(ltp.max_segment_payload_len, 1400);
+        assert_eq!(ltp.rtt, std::time::Duration::from_secs(2));
+        assert_eq!(ltp.ack_margin, std::time::Duration::from_millis(500));
+        assert_eq!(ltp.checkpoint_rtx_limit, 5);
+        assert_eq!(ltp.report_rtx_limit, 5);
+        assert_eq!(ltp.peers.len(), 1);
+        assert_eq!(ltp.peers[0].engine_id, hardy_ltp_cla::EngineId(200));
+        assert_eq!(
+            ltp.peers[0].address.as_ref().map(|a| a.to_string()),
+            Some("127.0.0.1:21112".to_string())
+        );
+        assert_eq!(
+            ltp.peers[0].node_id.as_ref().map(|n| n.to_string()),
+            Some("ipn:200.0".to_string())
+        );
+    }
+
+    // LTP CLA config parses KISS TCP transport.
+    #[test]
+    #[serial]
+    #[cfg(feature = "ltp-cla")]
+    fn ltp_cla_config_kiss_parses() {
+        let config = write_and_load(
+            "ltp_kiss.yaml",
+            r#"
+clas:
+  - name: ltp-kiss
+    type: ltp
+    engine-id: 1
+    transport:
+      type: kiss-tcp
+      server-addr: "127.0.0.1:8001"
+      port: 2
+"#,
+        );
+        let cla::ClaType::Ltp(ltp) = &config.clas[0].cla_type else {
+            panic!("expected an ltp CLA entry");
+        };
+        assert_eq!(ltp.engine_id, hardy_ltp_cla::EngineId(1));
+        match &ltp.transport {
+            hardy_ltp_cla::TransportMode::KissTcp {
+                server_addr, port, ..
+            } => {
+                assert_eq!(server_addr.to_string(), "127.0.0.1:8001");
+                assert_eq!(*port, 2);
+            }
+            _ => panic!("expected KissTcp transport"),
+        }
+    }
 }

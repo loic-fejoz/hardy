@@ -1,0 +1,36 @@
+[package]
+name = "hardy-ltp-cla"
+description = "An LTP (RFC 5326 / RFC 7122) and KISS convergence layer for Hardy BPv7"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["dtn", "bpv7", "convergence-layer", "ltp", "kiss"]
+categories = ["network-programming"]
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[features]
+default = []
+serde = ["dep:serde", "hardy-bpa/serde", "hardy-bpv7/serde", "hardy-ltp/serde", "dep:humantime"]
+instrument = ["tracing/attributes"]
+
+[dependencies]
+hardy-async = { version = "0.2", path = "../async" }
+hardy-bpa = { version = "0.2", path = "../bpa" }
+hardy-bpv7 = { version = "0.6", path = "../bpv7" }
+hardy-ltp = { version = "0.1", path = "../ltp" }
+tokio = { version = "1", features = ["macros", "net", "sync", "time", "rt", "io-util"] }
+tracing = { version = "0.1", default-features = false }
+thiserror = "2"
+bytes = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+humantime = { version = "2", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+sha2 = "0.10"

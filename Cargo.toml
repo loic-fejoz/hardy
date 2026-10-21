@@ -31,6 +31,8 @@ members = [
     "tcpclv4-server",
     "tools",
     "tvr",
+    "ltp",
+    "ltp-cla",
     "tests/bpsec",
     "tests/storage",
     "postgres-storage",

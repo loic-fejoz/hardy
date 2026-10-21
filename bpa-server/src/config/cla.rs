@@ -32,6 +32,10 @@ pub enum ClaType {
     #[serde(rename = "file-cla")]
     File(hardy_file_cla::Config),
 
+    #[cfg(feature = "ltp-cla")]
+    #[serde(rename = "ltp")]
+    Ltp(hardy_ltp_cla::Config),
+
     #[serde(untagged)]
     Other {
         #[serde(rename = "type")]
@@ -67,6 +71,10 @@ impl<'de> Deserialize<'de> for ClaType {
             #[cfg(feature = "file-cla")]
             "file-cla" => serde_json::from_value(config)
                 .map(Self::File)
+                .map_err(serde::de::Error::custom),
+            #[cfg(feature = "ltp-cla")]
+            "ltp" => serde_json::from_value(config)
+                .map(Self::Ltp)
                 .map_err(serde::de::Error::custom),
             _ => Ok(Self::Other { cla_type, config }),
         }

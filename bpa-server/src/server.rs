@@ -23,6 +23,8 @@ use hardy_echo_service::EchoService;
 use hardy_file_cla::Cla as FileCla;
 #[cfg(feature = "localdisk-storage")]
 use hardy_localdisk_storage::LocalDiskStorage;
+#[cfg(feature = "ltp-cla")]
+use hardy_ltp_cla::LtpCla;
 #[cfg(feature = "postgres-storage")]
 use hardy_postgres_storage::PostgresStorage;
 #[cfg(feature = "grpc")]
@@ -338,6 +340,11 @@ impl BpaServer {
                     Arc::new(FileCla::new(file).map_err(|e| {
                         anyhow::anyhow!("Failed to create CLA '{}': {e}", cla_config.name)
                     })?) as Arc<dyn Cla>,
+                    ClaInit::default(),
+                )),
+                #[cfg(feature = "ltp-cla")]
+                ClaType::Ltp(ltp_config) => Some((
+                    Arc::new(LtpCla::new(ltp_config.clone())) as Arc<dyn Cla>,
                     ClaInit::default(),
                 )),
                 ClaType::Other { cla_type, .. } => {

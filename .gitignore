@@ -10,3 +10,6 @@ bpa-server/certs/
 # MkDocs
 /site/
 /.venv/
+
+# External references and RFCs
+/references/
