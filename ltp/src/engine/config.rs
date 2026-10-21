@@ -25,6 +25,12 @@ pub struct EngineConfig {
     pub session_inactivity_timeout_micros: u64,
     /// Initial session number generator start value.
     pub initial_session_number: u64,
+    /// Maximum concurrent active receive sessions to mitigate DoS (default 1024).
+    pub max_recv_sessions: usize,
+    /// Maximum active unacknowledged reports tracked per session (default 64).
+    pub max_reports_per_session: usize,
+    /// Maximum reception claims included in a single report segment (default 20, RFC 5326 / ION limit).
+    pub max_claims_per_report: usize,
 }
 
 impl Default for EngineConfig {
@@ -40,6 +46,9 @@ impl Default for EngineConfig {
             max_block_size: 64 * 1024 * 1024,              // 64 MiB
             session_inactivity_timeout_micros: 60_000_000, // 60s
             initial_session_number: 1,
+            max_recv_sessions: 1024,
+            max_reports_per_session: 64,
+            max_claims_per_report: 20,
         }
     }
 }

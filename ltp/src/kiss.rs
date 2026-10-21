@@ -6,6 +6,7 @@
 
 use alloc::vec::Vec;
 
+use memchr::{memchr, memchr2};
 use thiserror::Error;
 
 /// Frame End delimiter (`0xC0`).
@@ -126,7 +127,7 @@ pub fn escape(input: &[u8], out: &mut Vec<u8>) {
     out.reserve(input.len());
     let mut start = 0;
     while start < input.len() {
-        match memchr::memchr2(FEND, FESC, &input[start..]) {
+        match memchr2(FEND, FESC, &input[start..]) {
             Some(rel_idx) => {
                 let pos = start + rel_idx;
                 out.extend_from_slice(&input[start..pos]);
@@ -155,16 +156,16 @@ pub fn escape(input: &[u8], out: &mut Vec<u8>) {
 /// Returns [`Error::InvalidEscape`] if `FESC` is followed by an invalid byte.
 /// Returns [`Error::TruncatedEscape`] if `FESC` is the last byte in the slice.
 pub fn unescape(input: &[u8]) -> Result<Vec<u8>> {
-    // Fast path: if there are no escape characters, copy the slice directly (SIMD memcpy).
-    if !input.contains(&FESC) {
+    let Some(first_fesc) = memchr(FESC, input) else {
         return Ok(input.to_vec());
-    }
+    };
 
     let mut out = Vec::with_capacity(input.len());
-    let mut start = 0;
+    out.extend_from_slice(&input[..first_fesc]);
+    let mut start = first_fesc;
 
     while start < input.len() {
-        match memchr::memchr(FESC, &input[start..]) {
+        match memchr(FESC, &input[start..]) {
             Some(rel_idx) => {
                 let pos = start + rel_idx;
                 out.extend_from_slice(&input[start..pos]);
@@ -195,7 +196,13 @@ pub fn encode_frame(port: u8, command: Command, payload: &[u8], out: &mut Vec<u8
     // Pre-reserve enough capacity for delimiters, command, and payload.
     out.reserve(4 + payload.len() + (payload.len() >> 6));
     out.push(FEND);
-    escape(&[cmd_byte], out);
+    if cmd_byte == FEND {
+        out.extend_from_slice(&[FESC, TFEND]);
+    } else if cmd_byte == FESC {
+        out.extend_from_slice(&[FESC, TFESC]);
+    } else {
+        out.push(cmd_byte);
+    }
     escape(payload, out);
     out.push(FEND);
 }
@@ -227,7 +234,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
 
         // Find the ending FEND delimiter with SIMD memchr
         let remaining = &cur[start_idx..];
-        let end_offset = match memchr::memchr(FEND, remaining) {
+        let end_offset = match memchr(FEND, remaining) {
             Some(pos) => pos,
             None => return Ok(None),
         };
@@ -240,8 +247,27 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
             continue;
         }
 
-        let unescaped = match unescape(frame_slice) {
-            Ok(u) => u,
+        // Decode the command byte directly from the start of frame_slice
+        let (cmd_byte, payload_slice) = if frame_slice[0] == FESC {
+            if frame_slice.len() < 2 {
+                base += start_idx + end_offset + 1;
+                continue;
+            }
+            let byte = match frame_slice[1] {
+                TFEND => FEND,
+                TFESC => FESC,
+                _ => {
+                    base += start_idx + end_offset + 1;
+                    continue;
+                }
+            };
+            (byte, &frame_slice[2..])
+        } else {
+            (frame_slice[0], &frame_slice[1..])
+        };
+
+        let payload = match unescape(payload_slice) {
+            Ok(p) => p,
             Err(_) => {
                 // Radio noise / corrupted escape sequence between FEND delimiters:
                 // Consume and discard this corrupted frame so subsequent valid frames are not blocked.
@@ -250,15 +276,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
             }
         };
 
-        if unescaped.is_empty() {
-            base += start_idx + end_offset + 1;
-            continue;
-        }
-
-        let cmd_byte = unescaped[0];
         let port = (cmd_byte >> 4) & 0x0F;
         let command = Command::from(cmd_byte & 0x0F);
-        let payload = unescaped[1..].to_vec();
 
         return Ok(Some((
             Frame {

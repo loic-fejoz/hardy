@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -15,7 +15,8 @@ use hardy_bpa::cla::{Acceptance, ClaAddress, ForwardBundleResult, Sink, Transfer
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
 use hardy_ltp::engine::{Engine, EngineConfig, Notice};
-use hardy_ltp::kiss::{decode_frame, encode_frame};
+use hardy_ltp::kiss::{Command, decode_frame, encode_frame};
+use hardy_ltp::segment::Segment;
 use hardy_ltp::types::{EngineId, SessionId};
 
 use crate::config::{Config, TransportMode};
@@ -69,13 +70,13 @@ impl Driver {
                 max_segment_payload_len: config.max_segment_payload_len,
                 checkpoint_rtx_limit: config.checkpoint_rtx_limit,
                 report_rtx_limit: config.report_rtx_limit,
-                rtt_micros: config.rtt.as_micros() as u64,
-                ack_margin_micros: config.ack_margin.as_micros() as u64,
+                rtt_micros: u64::try_from(config.rtt.as_micros()).unwrap_or(u64::MAX),
+                ack_margin_micros: u64::try_from(config.ack_margin.as_micros()).unwrap_or(u64::MAX),
                 ..Default::default()
             };
             let engine = Engine::new(engine_cfg);
 
-            let driver = Self {
+            let mut driver = Self {
                 config,
                 engine,
                 sink,
@@ -90,14 +91,22 @@ impl Driver {
             if let Err(err) = driver.run(addr_tx).await {
                 error!("LTP driver exited with error: {err}");
             }
+
+            // Clean shutdown: notify all remaining pending transfers with Failed outcome
+            for (_session, bundle_id) in driver.pending_transfers.drain() {
+                let _ = driver
+                    .sink
+                    .transfer_outcome(&bundle_id, TransferOutcome::Failed)
+                    .await;
+            }
         })
     }
 
     fn now_micros(&self) -> u64 {
-        self.start_time.elapsed().as_micros() as u64
+        u64::try_from(self.start_time.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
-    async fn run(self, addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>) -> Result<()> {
+    async fn run(&mut self, addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>) -> Result<()> {
         match self.config.transport.clone() {
             TransportMode::Udp { bind_addr } => self.run_udp(bind_addr, addr_tx).await,
             TransportMode::KissTcp {
@@ -121,7 +130,7 @@ impl Driver {
     }
 
     async fn run_udp(
-        mut self,
+        &mut self,
         bind_addr: SocketAddr,
         addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>,
     ) -> Result<()> {
@@ -152,8 +161,7 @@ impl Driver {
             let timer_future = async {
                 match next_timer {
                     Some(deadline) if deadline > now => {
-                        tokio::time::sleep(tokio::time::Duration::from_micros(deadline - now))
-                            .await;
+                        tokio::time::sleep(Duration::from_micros(deadline - now)).await;
                     }
                     Some(_) => {
                         // Expired or due immediately
@@ -168,16 +176,22 @@ impl Driver {
             tokio::select! {
                 // 1. Ingress UDP packet
                 recv_res = socket.recv_from(&mut rx_buf) => {
-                    let (len, peer_addr) = recv_res?;
+                    let (len, peer_addr) = match recv_res {
+                        Ok(res) => res,
+                        Err(err) => {
+                            warn!("LTP UDP recv_from error (transient): {err}");
+                            continue;
+                        }
+                    };
                     let now = self.now_micros();
 
-                    // Resolve peer engine ID
+                    // Resolve peer engine ID using peek_session to avoid full allocation
                     let peer_engine = if let Some(&id) = self.addr_to_engine.get(&peer_addr) {
                         id
-                    } else if let Ok((seg, _)) = hardy_ltp::segment::Segment::parse(&rx_buf[..len]) {
-                        let id = if seg.session.originator != self.config.engine_id {
-                            seg.session.originator
-                        } else if let Some(peer) = self.engine.peer_for_session(&seg.session) {
+                    } else if let Ok(session) = Segment::peek_session(&rx_buf[..len]) {
+                        let id = if session.originator != self.config.engine_id {
+                            session.originator
+                        } else if let Some(peer) = self.engine.peer_for_session(&session) {
                             peer
                         } else if self.engine_to_addr.len() == 1 {
                             *self.engine_to_addr.keys().next().unwrap()
@@ -185,13 +199,15 @@ impl Driver {
                             warn!("received packet from unregistered UDP peer {peer_addr}");
                             EngineId(peer_addr.port() as u64)
                         };
-                        // Associate dynamic peer ephemeral port with known engine
+                        // Associate dynamic peer ephemeral port with known engine, limiting table size
                         if self.engine_to_addr.contains_key(&id) {
+                            if self.addr_to_engine.len() >= 1024 {
+                                self.addr_to_engine.clear();
+                            }
                             self.addr_to_engine.insert(peer_addr, id);
                         }
                         id
                     } else {
-                        // Dynamic peer discovery from incoming address
                         warn!("received packet from unregistered UDP peer {peer_addr}");
                         EngineId(peer_addr.port() as u64)
                     };
@@ -227,9 +243,9 @@ impl Driver {
     }
 
     async fn run_kiss_tcp(
-        mut self,
+        &mut self,
         server_addr: SocketAddr,
-        _bind_addr: Option<SocketAddr>,
+        bind_addr: Option<SocketAddr>,
         port: u8,
         reconnect_initial_delay: Duration,
         reconnect_max_delay: Duration,
@@ -244,8 +260,21 @@ impl Driver {
 
         'reconnect_loop: loop {
             info!("connecting LTP CLA to KISS TCP server at {server_addr}");
-            let connect_res =
-                tokio::time::timeout(connect_timeout, TcpStream::connect(server_addr)).await;
+            let connect_fut = async {
+                if let Some(baddr) = bind_addr {
+                    let socket = if baddr.is_ipv4() {
+                        TcpSocket::new_v4()?
+                    } else {
+                        TcpSocket::new_v6()?
+                    };
+                    socket.bind(baddr)?;
+                    socket.connect(server_addr).await
+                } else {
+                    TcpStream::connect(server_addr).await
+                }
+            };
+
+            let connect_res = tokio::time::timeout(connect_timeout, connect_fut).await;
 
             match connect_res {
                 Ok(Ok(stream)) => {
@@ -260,18 +289,17 @@ impl Driver {
                     let mut raw_rx_buf = vec![0u8; 4096];
                     let mut kiss_accumulator = Vec::with_capacity(8192);
 
-                    // Drain any output segments queued while disconnected.
-                    // Raw LTP segments are framed directly in KISS Command 0 (Data) frames
-                    // without AX.25 headers to eliminate unnecessary overhead on radio links.
-                    let mut write_err = false;
+                    // Drain any output segments queued while disconnected in a single batched buffer
+                    let mut frame_buf = Vec::new();
                     while let Some((_peer, bytes)) = self.engine.poll_output() {
-                        let mut frame_buf = Vec::new();
-                        encode_frame(port, hardy_ltp::kiss::Command::Data, &bytes, &mut frame_buf);
-                        if let Err(e) = writer.write_all(&frame_buf).await {
-                            warn!("KISS TCP initial write error to {server_addr}: {e}");
-                            write_err = true;
-                            break;
-                        }
+                        encode_frame(port, Command::Data, &bytes, &mut frame_buf);
+                    }
+                    let mut write_err = false;
+                    if !frame_buf.is_empty()
+                        && let Err(e) = writer.write_all(&frame_buf).await
+                    {
+                        warn!("KISS TCP initial write error to {server_addr}: {e}");
+                        write_err = true;
                     }
 
                     if !write_err {
@@ -282,10 +310,8 @@ impl Driver {
                             let timer_future = async {
                                 match next_timer {
                                     Some(deadline) if deadline > now => {
-                                        tokio::time::sleep(tokio::time::Duration::from_micros(
-                                            deadline - now,
-                                        ))
-                                        .await;
+                                        tokio::time::sleep(Duration::from_micros(deadline - now))
+                                            .await;
                                     }
                                     Some(_) => {}
                                     None => {
@@ -310,15 +336,29 @@ impl Driver {
                                             }
                                             kiss_accumulator.extend_from_slice(&raw_rx_buf[..n]);
 
-                                            // Extract all complete KISS frames.
-                                            // Frames encapsulate pure raw LTP wire segments directly (Command::Data).
-                                            while let Ok(Some((frame, consumed))) = decode_frame(&kiss_accumulator) {
-                                                kiss_accumulator.drain(..consumed);
-                                                if frame.command == hardy_ltp::kiss::Command::Data {
+                                            // Extract all complete KISS frames with linear O(N) cursor traversal
+                                            let mut offset = 0;
+                                            while let Ok(Some((frame, consumed))) = decode_frame(&kiss_accumulator[offset..]) {
+                                                offset += consumed;
+                                                if frame.command == Command::Data {
                                                     let now = self.now_micros();
-                                                    let peer_engine = self.engine_to_addr.keys().copied().next().unwrap_or(EngineId(2));
+                                                    // Dynamic peer identification on KISS frames (supports shared TNC / multi-station)
+                                                    let peer_engine = if let Ok(session) = Segment::peek_session(&frame.payload) {
+                                                        if session.originator != self.config.engine_id {
+                                                            session.originator
+                                                        } else if let Some(peer) = self.engine.peer_for_session(&session) {
+                                                            peer
+                                                        } else {
+                                                            self.engine_to_addr.keys().copied().next().unwrap_or(EngineId(2))
+                                                        }
+                                                    } else {
+                                                        self.engine_to_addr.keys().copied().next().unwrap_or(EngineId(2))
+                                                    };
                                                     let _ = self.engine.handle_incoming_segment(peer_engine, &frame.payload, now);
                                                 }
+                                            }
+                                            if offset > 0 {
+                                                kiss_accumulator.drain(..offset);
                                             }
                                         }
                                         Err(e) => {
@@ -343,23 +383,15 @@ impl Driver {
                                 }
                             }
 
-                            // Drain outputs over KISS directly into Command 0 (Data) frames
-                            let mut write_failed = false;
+                            // Drain outputs over KISS in batches with a single write_all
+                            let mut frame_buf = Vec::new();
                             while let Some((_peer, bytes)) = self.engine.poll_output() {
-                                let mut frame_buf = Vec::new();
-                                encode_frame(
-                                    port,
-                                    hardy_ltp::kiss::Command::Data,
-                                    &bytes,
-                                    &mut frame_buf,
-                                );
-                                if let Err(e) = writer.write_all(&frame_buf).await {
-                                    warn!("KISS TCP write error to {server_addr}: {e}");
-                                    write_failed = true;
-                                    break;
-                                }
+                                encode_frame(port, Command::Data, &bytes, &mut frame_buf);
                             }
-                            if write_failed {
+                            if !frame_buf.is_empty()
+                                && let Err(e) = writer.write_all(&frame_buf).await
+                            {
+                                warn!("KISS TCP write error to {server_addr}: {e}");
                                 break "write error";
                             }
 
@@ -396,8 +428,7 @@ impl Driver {
                 let timer_future = async {
                     match next_timer {
                         Some(deadline) if deadline > now => {
-                            tokio::time::sleep(tokio::time::Duration::from_micros(deadline - now))
-                                .await;
+                            tokio::time::sleep(Duration::from_micros(deadline - now)).await;
                         }
                         Some(_) => {}
                         None => {
@@ -469,7 +500,15 @@ impl Driver {
                 }
                 Ok(true)
             }
-            DriverCommand::Shutdown => Ok(false),
+            DriverCommand::Shutdown => {
+                for (_, bundle_id) in self.pending_transfers.drain() {
+                    let _ = self
+                        .sink
+                        .transfer_outcome(&bundle_id, TransferOutcome::Failed)
+                        .await;
+                }
+                Ok(false)
+            }
         }
     }
 

@@ -407,3 +407,191 @@ async fn test_kiss_tcp_reconnection_and_backoff() {
 
     cla.unregister().await;
 }
+
+#[tokio::test]
+async fn test_s17_multi_station_kiss_tcp_peer_resolution() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    let (frame_tx, mut frame_rx) = mpsc::channel(16);
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut accum = Vec::new();
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            accum.extend_from_slice(&buf[..n]);
+            let mut offset = 0;
+            while let Ok(Some((frame, consumed))) = hardy_ltp::kiss::decode_frame(&accum[offset..])
+            {
+                offset += consumed;
+                if frame.command == hardy_ltp::kiss::Command::Data {
+                    let _ = frame_tx.send(frame.payload).await;
+                }
+            }
+            if offset > 0 {
+                accum.drain(..offset);
+            }
+        }
+    });
+
+    let (disp_tx, _disp_rx) = mpsc::channel(16);
+    let (outc_tx, _outc_rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::KissTcp {
+            server_addr,
+            bind_addr: None,
+            port: 0,
+            reconnect_initial_delay: Duration::from_millis(50),
+            reconnect_max_delay: Duration::from_millis(200),
+        },
+        max_segment_payload_len: 1024,
+        rtt: Duration::from_millis(100),
+        ack_margin: Duration::from_millis(50),
+        checkpoint_rtx_limit: 3,
+        report_rtx_limit: 3,
+        peers: vec![
+            PeerEntry {
+                engine_id: EngineId(2),
+                address: None, // Defaults to server_addr
+                node_id: Some("dtn://station2/".parse().unwrap()),
+            },
+            PeerEntry {
+                engine_id: EngineId(3),
+                address: None, // Defaults to server_addr
+                node_id: Some("dtn://station3/".parse().unwrap()),
+            },
+        ],
+    };
+
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    // Send bundle to station 2
+    let payload2 = vec![0x22; 64];
+    let bundle2 = create_test_bundle_id("bundle-to-station-2");
+    let mut stream2 = Bytes::copy_from_slice(&payload2);
+    let addr2 = ClaAddress::Private(Bytes::copy_from_slice(&2u64.to_be_bytes()));
+    let res2 = cla
+        .forward(None, &addr2, &bundle2, payload2.len() as u64, &mut stream2)
+        .await
+        .expect("forward to station 2 succeeds");
+    assert!(matches!(res2, ForwardBundleResult::Accepted));
+
+    // Send bundle to station 3
+    let payload3 = vec![0x33; 64];
+    let bundle3 = create_test_bundle_id("bundle-to-station-3");
+    let mut stream3 = Bytes::copy_from_slice(&payload3);
+    let addr3 = ClaAddress::Private(Bytes::copy_from_slice(&3u64.to_be_bytes()));
+    let res3 = cla
+        .forward(None, &addr3, &bundle3, payload3.len() as u64, &mut stream3)
+        .await
+        .expect("forward to station 3 succeeds");
+    assert!(matches!(res3, ForwardBundleResult::Accepted));
+
+    // Receive both frames over the single KISS TCP connection
+    let f1 = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must receive frame 1");
+    let f2 = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must receive frame 2");
+
+    let (seg1, _) = hardy_ltp::segment::Segment::parse(&f1).unwrap();
+    let (seg2, _) = hardy_ltp::segment::Segment::parse(&f2).unwrap();
+
+    assert_eq!(seg1.session.originator, EngineId(1));
+    assert_eq!(seg2.session.originator, EngineId(1));
+    // Verify distinct session numbers for the two destinations
+    assert_ne!(seg1.session.number, seg2.session.number);
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_s18_driver_shutdown_notifies_pending_transfers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+
+    // Accept connection so driver is connected, but do not send LTP acknowledgments (keeps transfer pending)
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+
+    let (disp_tx, _disp_rx) = mpsc::channel(16);
+    let (outc_tx, mut outc_rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::KissTcp {
+            server_addr,
+            bind_addr: None,
+            port: 0,
+            reconnect_initial_delay: Duration::from_millis(50),
+            reconnect_max_delay: Duration::from_millis(200),
+        },
+        max_segment_payload_len: 1024,
+        rtt: Duration::from_secs(10), // Long RTT so it doesn't expire during test
+        ack_margin: Duration::from_secs(5),
+        checkpoint_rtx_limit: 5,
+        report_rtx_limit: 5,
+        peers: vec![PeerEntry {
+            engine_id: EngineId(2),
+            address: Some(server_addr),
+            node_id: None,
+        }],
+    };
+
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    let payload = vec![0xEE; 128];
+    let bundle_id = create_test_bundle_id("pending-bundle");
+    let mut stream = Bytes::copy_from_slice(&payload);
+
+    let res = cla
+        .forward(
+            None,
+            &ClaAddress::Tcp(server_addr),
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Unregister / shutdown the CLA while the transfer is still pending
+    cla.unregister().await;
+
+    // Driver shutdown MUST notify pending transfer with TransferOutcome::Failed
+    let (notified_id, outcome) = tokio::time::timeout(Duration::from_secs(5), outc_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must receive outcome notification");
+
+    assert_eq!(notified_id, bundle_id);
+    assert_eq!(outcome, TransferOutcome::Failed);
+}

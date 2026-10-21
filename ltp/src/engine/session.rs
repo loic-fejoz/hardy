@@ -138,6 +138,14 @@ pub struct RecvSession {
     pub red_delivered: bool,
     /// Monotonic timestamp of last session activity in microseconds.
     pub last_activity: u64,
+    /// Out-of-order red segments awaiting contiguous reassembly.
+    pub sparse_red: BTreeMap<u64, Bytes>,
+    /// Total received bytes in sparse buffer to prevent memory exhaustion.
+    pub total_received_bytes: usize,
+    /// Minimum received green data offset for Miscolored detection (RFC 5326 §6.21).
+    pub min_green_offset: Option<u64>,
+    /// Maximum end offset of received red data.
+    pub max_red_end: u64,
     /// Cancellation reason if this session is currently cancelling.
     pub cancel_reason: Option<CancelReason>,
     /// Number of cancellation segments transmitted.
@@ -169,12 +177,16 @@ impl RecvSession {
             reported_coverage: RangeSet::new(),
             red_delivered: false,
             last_activity: now,
+            sparse_red: BTreeMap::new(),
+            total_received_bytes: 0,
+            min_green_offset: None,
+            max_red_end: 0,
             cancel_reason: None,
             cancel_retries: 0,
         }
     }
 
-    /// Stores a red data segment into the reassembly buffer.
+    /// Stores a red data segment into the reassembly buffer with sparse out-of-order storage.
     pub fn insert_red(&mut self, offset: u64, data: &[u8], max_block_size: u64) -> bool {
         let Some(end) = offset.checked_add(data.len() as u64) else {
             return false;
@@ -182,6 +194,10 @@ impl RecvSession {
         if end > max_block_size {
             return false;
         }
+        if self.red_received.covers(&(offset..end)) {
+            return true;
+        }
+
         let Ok(start_idx) = usize::try_from(offset) else {
             return false;
         };
@@ -189,12 +205,40 @@ impl RecvSession {
             return false;
         };
 
-        if self.red_buf.len() < end_idx {
-            self.red_buf.resize(end_idx, 0);
-        }
+        self.max_red_end = self.max_red_end.max(end);
 
-        self.red_buf[start_idx..end_idx].copy_from_slice(data);
-        self.red_received.insert(offset..end);
+        if start_idx <= self.red_buf.len() {
+            // Contiguous or partially overlapping with existing buffer
+            if end_idx > self.red_buf.len() {
+                self.red_buf.resize(end_idx, 0);
+            }
+            self.red_buf[start_idx..end_idx].copy_from_slice(data);
+            self.red_received.insert(offset..end);
+
+            // Connect any sparse segments that are now adjacent to red_buf
+            while let Some((&sp_offset, _)) = self.sparse_red.first_key_value() {
+                if (sp_offset as usize) <= self.red_buf.len() {
+                    let (_, sp_bytes) = self.sparse_red.pop_first().expect("non-empty");
+                    self.total_received_bytes =
+                        self.total_received_bytes.saturating_sub(sp_bytes.len());
+                    let sp_end = (sp_offset as usize).saturating_add(sp_bytes.len());
+                    if sp_end > self.red_buf.len() {
+                        self.red_buf.resize(sp_end, 0);
+                    }
+                    self.red_buf[sp_offset as usize..sp_end].copy_from_slice(&sp_bytes);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Out of order gap: store in sparse buffer without expanding red_buf with millions of 0 bytes!
+            if self.total_received_bytes.saturating_add(data.len()) > (max_block_size as usize) {
+                return false;
+            }
+            self.sparse_red.insert(offset, Bytes::copy_from_slice(data));
+            self.total_received_bytes += data.len();
+            self.red_received.insert(offset..end);
+        }
         true
     }
 

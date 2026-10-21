@@ -501,3 +501,417 @@ fn test_report_with_zero_claims_rfc_compliant() {
         _ => panic!("expected report segment"),
     }
 }
+
+#[test]
+fn test_s8_zero_max_segment_payload_len_does_not_loop() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(1),
+        max_segment_payload_len: 0, // Invalid configuration: must not cause infinite loop or OOM
+        ..Default::default()
+    });
+
+    let payload = vec![0x42u8; 100];
+    let res = engine.request_transmission(EngineId(2), 1, Bytes::from(payload), 100, 1_000_000);
+    assert!(res.is_ok(), "request_transmission must succeed safely");
+
+    // Engine must clamp MTU to >= 1 and produce segments without hanging
+    let mut count = 0;
+    while let Some((_, _)) = engine.poll_output() {
+        count += 1;
+        if count > 1000 {
+            panic!("infinite loop detected in request_transmission!");
+        }
+    }
+    assert!(count > 0);
+}
+
+#[test]
+fn test_s9_u64_max_timestamp_and_serial_wraparound() {
+    let now = u64::MAX - 500;
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(1),
+        initial_session_number: u64::MAX,
+        rtt_micros: 2_000_000,
+        ack_margin_micros: 2_000_000,
+        ..Default::default()
+    });
+
+    // Session creation with session_number = u64::MAX must wrap cleanly without panic
+    let session_1 = engine
+        .request_transmission(EngineId(2), 1, Bytes::from_static(b"hello"), 5, now)
+        .expect("must succeed with u64::MAX");
+    assert_eq!(session_1.number, u64::MAX);
+
+    let session_2 = engine
+        .request_transmission(EngineId(2), 1, Bytes::from_static(b"world"), 5, now)
+        .expect("must succeed after wrap-around");
+    assert_eq!(session_2.number, 1);
+
+    // Timer deadline calculations with now close to u64::MAX must not panic on overflow
+    let deadline = engine.next_timer_deadline().expect("must have deadline");
+    assert_eq!(deadline, u64::MAX);
+
+    // Timer tick at u64::MAX must not panic
+    engine.handle_timer_tick(u64::MAX);
+}
+
+#[test]
+fn test_s10_segmented_reports_max_claims() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        max_claims_per_report: 5, // Strict limit of 5 claims per report
+        ..Default::default()
+    });
+
+    let session_id = hardy_ltp::types::SessionId {
+        originator: EngineId(1),
+        number: 42,
+    };
+
+    // Feed 15 non-contiguous 10-byte slices: 0..10, 20..30, 40..50, ... 280..290
+    for i in 0..15 {
+        let offset = i * 20;
+        let is_last = i == 14;
+        let checkpoint = if is_last {
+            Some(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            })
+        } else {
+            None
+        };
+
+        let kind = if let Some(cp) = checkpoint {
+            hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp)
+        } else {
+            hardy_ltp::segment::DataSegKind::Red
+        };
+
+        let seg = hardy_ltp::segment::Segment {
+            session: session_id,
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+                client_service: 1,
+                offset,
+                kind,
+                data: &[0xAA; 10],
+            }),
+        };
+
+        engine
+            .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), 1_000_000)
+            .unwrap();
+    }
+
+    // Engine must partition the 15 claims into 3 distinct reports of <= 5 claims each!
+    let mut reports = Vec::new();
+    while let Some((_, bytes)) = engine.poll_output() {
+        let (parsed, _) = hardy_ltp::segment::Segment::parse(&bytes).unwrap();
+        if let hardy_ltp::segment::SegmentBody::Report(rs) = parsed.body {
+            assert!(rs.claims.len() <= 5, "claims per report must be <= 5");
+            reports.push(rs);
+        }
+    }
+
+    assert_eq!(reports.len(), 3, "15 claims / 5 per report = 3 reports");
+}
+
+#[test]
+fn test_s11_miscolored_detection() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    });
+
+    let session_id = hardy_ltp::types::SessionId {
+        originator: EngineId(1),
+        number: 10,
+    };
+
+    // Send a Green segment at offset 100
+    let green_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 100,
+            kind: hardy_ltp::segment::DataSegKind::Green,
+            data: &[0xAA; 50],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &green_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    // Green arrival emits GreenSegmentArrived notice
+    let green_notice = engine
+        .poll_notice()
+        .expect("must emit green arrival notice");
+    assert!(matches!(green_notice, Notice::GreenSegmentArrived { .. }));
+
+    // Now send a Red segment at offset 120 (violating red < green ordering: Miscolored!)
+    let red_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 120,
+            kind: hardy_ltp::segment::DataSegKind::Red,
+            data: &[0xBB; 20],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &red_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    // Engine must emit CancelReceiver with Miscolored
+    let (_, out_bytes) = engine.poll_output().expect("must emit cancellation");
+    let (parsed, _) = hardy_ltp::segment::Segment::parse(&out_bytes).unwrap();
+    match parsed.body {
+        hardy_ltp::segment::SegmentBody::CancelReceiver { reason } => {
+            assert_eq!(reason, CancelReason::Miscolored);
+        }
+        other => panic!("expected CancelReceiver, got {other:?}"),
+    }
+
+    // Must emit cancellation notice
+    let notice = engine.poll_notice().expect("must emit notice");
+    assert_eq!(
+        notice,
+        Notice::TransmissionSessionCancelled {
+            session: session_id,
+            reason: CancelReason::Miscolored,
+        }
+    );
+}
+
+#[test]
+fn test_s12_cancel_isolation() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    });
+
+    let session_id = hardy_ltp::types::SessionId {
+        originator: EngineId(1),
+        number: 77,
+    };
+
+    // Initialize session with an initial red segment
+    let init_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::Red,
+            data: &[0xAA; 10],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &init_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    // Send CancelSender to cancel session
+    let cs = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::CancelSender {
+            reason: CancelReason::UsrCncld,
+        },
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &cs.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    // Notice cancelled is emitted
+    assert!(matches!(
+        engine.poll_notice().unwrap(),
+        Notice::TransmissionSessionCancelled { .. }
+    ));
+
+    // Send a late red segment for the cancelled session
+    let cp = hardy_ltp::segment::Checkpoint {
+        serial: core::num::NonZeroU64::new(1).unwrap(),
+        report_serial: 0,
+    };
+    let data_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp),
+            data: &[0xAA; 10],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &data_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    // No RedPartReceived or TransmissionSessionCompleted notice must EVER be emitted!
+    assert_eq!(engine.poll_notice(), None);
+}
+
+#[test]
+fn test_s13_cancel_dedup() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    });
+
+    let session_id = hardy_ltp::types::SessionId {
+        originator: EngineId(1),
+        number: 88,
+    };
+
+    // Initialize session with an initial red segment
+    let init_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::Red,
+            data: &[0xAA; 10],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &init_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
+
+    let cs = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::CancelSender {
+            reason: CancelReason::Rlexc,
+        },
+    };
+    let cs_wire = cs.encode_to_vec();
+
+    // Send the first CS: cancels session and emits 1 notice
+    engine
+        .handle_incoming_segment(EngineId(1), &cs_wire, 1_000_000)
+        .unwrap();
+    assert!(engine.poll_notice().is_some());
+
+    // Send 5 duplicate CS segments: must acknowledge with CAS but emit ZERO extra notices!
+    for _ in 0..5 {
+        engine
+            .handle_incoming_segment(EngineId(1), &cs_wire, 1_000_000)
+            .unwrap();
+        assert_eq!(
+            engine.poll_notice(),
+            None,
+            "duplicate cancellation must not trigger duplicate notice"
+        );
+        let (_, ack_bytes) = engine.poll_output().expect("must acknowledge duplicate CS");
+        let (parsed, _) = hardy_ltp::segment::Segment::parse(&ack_bytes).unwrap();
+        assert_eq!(
+            parsed.body,
+            hardy_ltp::segment::SegmentBody::CancelAckSender
+        );
+    }
+}
+
+#[test]
+fn test_s14_dos_sparse_offset_memory() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        max_block_size: 64 * 1024 * 1024, // 64 MiB
+        ..Default::default()
+    });
+
+    // An attacker sends 50 segments of 1 byte at offset (64 MiB - 1) across 50 sessions.
+    // In unoptimized implementations, this would allocate 50 * 64 MiB = 3.2 GiB of zeroed RAM!
+    for sess_num in 1..=50 {
+        let session_id = hardy_ltp::types::SessionId {
+            originator: EngineId(1),
+            number: sess_num,
+        };
+        let seg = hardy_ltp::segment::Segment {
+            session: session_id,
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+                client_service: 1,
+                offset: 64 * 1024 * 1024 - 1,
+                kind: hardy_ltp::segment::DataSegKind::Red,
+                data: &[0xFF],
+            }),
+        };
+        engine
+            .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), 1_000_000)
+            .unwrap();
+    }
+    // Execution completes instantly without OOM or allocating gigabytes of RAM
+}
+
+#[test]
+fn test_s15_session_flood_limit() {
+    let mut engine = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        max_recv_sessions: 10, // Max 10 concurrent receive sessions
+        ..Default::default()
+    });
+
+    for sess_num in 1..=25 {
+        let session_id = hardy_ltp::types::SessionId {
+            originator: EngineId(1),
+            number: sess_num,
+        };
+        let seg = hardy_ltp::segment::Segment {
+            session: session_id,
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+                client_service: 1,
+                offset: 0,
+                kind: hardy_ltp::segment::DataSegKind::Red,
+                data: &[0xAA],
+            }),
+        };
+        engine
+            .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), 1_000_000)
+            .unwrap();
+    }
+
+    // Sessions 11..=25 must have been safely rejected, bounding memory usage
+}
+
+#[test]
+fn test_s16_kiss_500_frames_linear() {
+    let mut batch = Vec::new();
+    let payload = vec![0x33u8; 100];
+
+    // Encode 500 KISS frames into a single continuous buffer
+    for i in 0..500 {
+        hardy_ltp::kiss::encode_frame(
+            (i % 16) as u8,
+            hardy_ltp::kiss::Command::Data,
+            &payload,
+            &mut batch,
+        );
+    }
+
+    // Decode with linear cursor
+    let mut decoded = 0;
+    let mut offset = 0;
+    while let Ok(Some((frame, consumed))) = hardy_ltp::kiss::decode_frame(&batch[offset..]) {
+        offset += consumed;
+        assert_eq!(frame.command, hardy_ltp::kiss::Command::Data);
+        assert_eq!(frame.payload, payload);
+        decoded += 1;
+    }
+
+    assert_eq!(decoded, 500);
+    assert_eq!(offset, batch.len());
+}

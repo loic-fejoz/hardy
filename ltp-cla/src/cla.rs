@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
@@ -87,11 +88,13 @@ impl LtpCla {
         Ok(())
     }
 
-    /// Unregisters this CLA from the BPA.
+    /// Unregisters this CLA from the BPA and shuts down the background driver.
     pub async fn unregister(&self) {
-        let inner_guard = self.inner.read().await;
-        if let Some(inner) = inner_guard.as_ref() {
+        let mut inner_guard = self.inner.write().await;
+        if let Some(inner) = inner_guard.take() {
             inner.sink.unregister().await;
+            drop(inner.cmd_tx);
+            let _ = inner._driver_handle.await;
         }
     }
 }
@@ -126,16 +129,25 @@ impl Cla for LtpCla {
         };
 
         // Pre-populate driver with configured peers from config
+        let default_server_addr = match &self.config.transport {
+            crate::config::TransportMode::KissTcp { server_addr, .. } => Some(*server_addr),
+            crate::config::TransportMode::Udp { .. } => None,
+        };
+
         for peer in &self.config.peers {
-            if let Some(addr) = peer.address {
-                let cla_addr = ClaAddress::Tcp(addr);
-                self.peer_mappings
-                    .write()
-                    .await
-                    .insert(cla_addr.clone(), peer.engine_id);
-                if let Some(ref node_id) = peer.node_id {
-                    let _ = sink.add_peer(cla_addr, std::slice::from_ref(node_id)).await;
-                }
+            let cla_addr = if let Some(addr) = peer.address {
+                ClaAddress::Tcp(addr)
+            } else {
+                ClaAddress::Private(Bytes::copy_from_slice(&peer.engine_id.0.to_be_bytes()))
+            };
+            self.peer_mappings
+                .write()
+                .await
+                .insert(cla_addr.clone(), peer.engine_id);
+            if let Some(ref node_id) = peer.node_id {
+                let _ = sink.add_peer(cla_addr, std::slice::from_ref(node_id)).await;
+            }
+            if let Some(addr) = peer.address.or(default_server_addr) {
                 let _ = cmd_tx
                     .send(DriverCommand::RegisterPeer {
                         engine_id: peer.engine_id,
@@ -174,6 +186,7 @@ impl Cla for LtpCla {
         let mut inner_guard = self.inner.write().await;
         if let Some(inner) = inner_guard.take() {
             let _ = inner.cmd_tx.send(DriverCommand::Shutdown).await;
+            let _ = inner._driver_handle.await;
         }
     }
 
@@ -198,13 +211,20 @@ impl Cla for LtpCla {
             let mappings = self.peer_mappings.read().await;
             if let Some(&id) = mappings.get(cla_addr) {
                 id
-            } else if let ClaAddress::Tcp(addr) = cla_addr {
-                // Default engine ID from port if no explicit mapping
-                EngineId(addr.port() as u64)
             } else {
-                return Err(hardy_bpa::cla::Error::from(
-                    crate::error::Error::UnknownPeer(cla_addr.clone()),
-                ));
+                match cla_addr {
+                    ClaAddress::Tcp(addr) => EngineId(addr.port() as u64),
+                    ClaAddress::Private(b) if b.len() == 8 => {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(b);
+                        EngineId(u64::from_be_bytes(arr))
+                    }
+                    _ => {
+                        return Err(hardy_bpa::cla::Error::from(
+                            crate::error::Error::UnknownPeer(cla_addr.clone()),
+                        ));
+                    }
+                }
             }
         };
 

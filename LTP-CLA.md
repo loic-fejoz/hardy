@@ -390,3 +390,72 @@ Revue approfondie du code de `ltp/` et `ltp-cla/` (branche `feat/ltp-cla`) avec 
 | S6 | Interop | Altération 15% perte, duplication, gigue Hardy ↔ Licklider | Correction protocolaire | **Validé** (tests `interop_licklider`) |
 | S7 | Interop | Ping bidirectionnel Hardy ↔ ION 4.1.4 + capture Wireshark | Interopérabilité RFC 5326 / RFC 7122 | **Validé** (`test_ion_ltp_ping.sh`) |
 
+---
+
+## 10. Audit de niveau industriel (Passe 2) — Points à corriger et nouveaux scénarios de test
+
+Seconde passe d'audit approfondie de `hardy-ltp` et `hardy-ltp-cla` axée sur la robustesse industrielle : élimination absolue de tout panic ou boucle infinie, sécurité 32-bit stricte, conformité fine à la RFC 5326, résilience aux attaques par déni de service (DoS mémoire/CPU), complexité algorithmique et optimisations SIMD / zéro-copie.
+
+### 10.1 Panics, arithmétique saturée et sécurité 32-bit
+
+- [x] **[CRITIQUE] Boucle infinie et OOM si `max_segment_payload_len == 0`** : Dans `Engine::request_transmission` (`ltp/src/engine/mod.rs`) et `Engine::handle_incoming_report`, `mtu` est désormais systématiquement borné à `.max(1)`, empêchant toute boucle infinie d'offsets nuls ou allocation démesurée.
+- [x] **[CRITIQUE] Troncature 32-bit lors du calcul de `chunk_len`** : Remplacement des casts prématurés par `(red_len - offset).min(mtu as u64) as usize` et `(gap.end - offset).min(mtu as u64) as usize`, garantissant une parfaite sécurité sur les cibles 32 bits.
+- [x] **[CRITIQUE] Débordement arithmétique sur le calcul des échéances (`deadline`)** : Utilisation systématique de `now.saturating_add(...)` sur tous les calculs de deadlines dans l'ensemble des modules d'`Engine`.
+- [x] **[MAJEUR] Panic potentiel sur débordement de `last_cp_serial` et `last_report_serial`** : Utilisation du helper circulaire `next_nonzero_serial(&mut u64) -> NonZeroU64` assurant un bouclage propre de `u64::MAX` à `1` sans jamais paniquer.
+- [x] **[MINEUR] Additions non saturées dans `handle_incoming_report_ack` et troncature `u128 -> u64` des durées** : Additions saturantes appliquées sur les claims de rapport et conversion sécurisée `u64::try_from(as_micros()).unwrap_or(u64::MAX)` dans le driver.
+
+### 10.2 Correction protocolaire stricte (RFC 5326)
+
+- [x] **[MAJEUR] Segmentation des `ReportSegment` au-delà de `MAX_CLAIMS_PER_RS` (20 claims, RFC 5326 §6.11 / ION)** : Partitionnement automatique des claims par paquets de `max_claims_per_report` (défaut 20) avec recalcul dynamique des bornes `lower_bound` et `upper_bound` de chaque segment de rapport.
+- [x] **[MAJEUR] Détection des violations Red/Green (`CancelReason::Miscolored`, RFC 5326 §6.21) et cohérence de EORP/EOB** : Vérification stricte des intervalles Red et Green reçus (`min_green_offset`, `max_red_end`, `red_part_len`), avec émission immédiate de `CancelReceiver(Miscolored)` et notification d'annulation en cas de chevauchement illicite.
+- [x] **[MAJEUR] Isolation des sessions en cours d'annulation (`cancel_reason.is_some()`)** : Ignorance stricte des segments de données et rapports reçus pour toute session en cours d'annulation ou annulée (`cancelled_sessions_set`), garantissant l'absence de notices de complétion post-annulation.
+- [x] **[MAJEUR] Déduplication des `Notice::TransmissionSessionCancelled` sur réception de `CS`/`CR` répétés** : Émission de la notice d'annulation uniquement sur la première transition d'état d'une session active, avec acquittement `CAS`/`CAR` systématique des segments de cancel dupliqués sans notice redondante.
+- [x] **[MINEUR] Support de `report_lower_bound` dans la génération des RS** : Alignement précis des offsets de claims sur la borne inférieure du rapport partiel.
+
+### 10.3 Résilience réseau, protection mémoire et anti-DoS
+
+- [x] **[CRITIQUE] Allocation paresseuse par fragments dans `RecvSession` (anti-DoS par segment à grand offset)** : Remplacement de l'extension immédiate du tampon par un stockage de segments épars (`sparse_red: BTreeMap<u64, Bytes>`) et quota total d'octets reçus, différant l'allocation du tampon contigu jusqu'à ce que les offsets soient contigus ou complétés.
+- [x] **[CRITIQUE] Plafonds du nombre de sessions concurrentes et de rapports par session (`EngineConfig`)** : Ajout des plafonds configurables `max_recv_sessions` (défaut 1024) et `max_reports_per_session` (défaut 64) avec rejet propre des sessions au-delà du seuil.
+- [x] **[MAJEUR] Résilience du driver UDP aux erreurs I/O transitoires (`socket.recv_from`)** : Gestion tolérante des erreurs transitoires avec journalisation `warn!` sans avortement de la boucle d'écoute du driver.
+- [x] **[MAJEUR] Nettoyage et borne de `addr_to_engine` dans le driver UDP** : Limitation de taille et éviction LRU pour éviter les fuites mémoire lors de réassignations de ports éphémères.
+- [x] **[MAJEUR] Enregistrement des pairs KISS sans adresse IP spécifique et respect de `bind_addr` en KISS TCP** :
+  1. Utilisation de l'adresse par défaut `server_addr` pour les pairs sans champ `address` explicite et support de `ClaAddress::Private` pour l'adressage de pairs multiples derrière un TNC KISS TCP partagé.
+  2. Résolution d'EngineId sur trame KISS via `peek_session` et `peer_for_session`.
+  3. Prise en compte de `bind_addr: Option<SocketAddr>` lors de l'établissement du socket TCP KISS.
+- [x] **[MINEUR] Notification d'échec des transferts en attente lors de l'arrêt du driver (`Shutdown`)** : Vidage ordonné de `pending_transfers` lors du shutdown avec émission de `TransferOutcome::Failed` pour tous les transferts non complétés.
+
+### 10.4 Performances, complexité algorithmique, zéro-copie et autovectorisation
+
+- [x] **[MAJEUR] Complexité $O(1)$ pour `next_timer_deadline` et les timeouts d'inactivité** : Intégration de `TimerKind::Inactivity` dans la `TimerTable`, transformant le calcul de la prochaine échéance en un pur accès $O(1)$ sans balayage linéaire des sessions.
+- [x] **[MAJEUR] Indexation ordonnée par `SessionId` dans `TimerTable::cancel_session` ($O(\log N)$ au lieu de $O(N)$)** : Restructuration de `TimerKey` avec `SessionId` en premier champ de tri, permettant des annulations de session par recherche de plage `range(...)` en $O(\log N + K)$.
+- [x] **[MAJEUR] Élimination du déplacement quadratique $O(N^2)$ de `kiss_accumulator` et de la double allocation dans `decode_frame`** :
+  1. Décodage par curseur linéaire sans déplacement intermédiaire `drain(..consumed)` par trame.
+  2. Accélération de `unescape` via recherche vectorisée `memchr` du premier `FESC`.
+  3. Décodage direct de la commande avant unescaping, supprimant l'allocation superflue du payload intermédiaire.
+- [x] **[MAJEUR] Livraison Red en zéro-copie (`mem::take`) et utilisation de `Bytes` dans `Engine`** :
+  1. Handoff zéro-copie du tampon de réception `red_buf` au notice `RedPartReceived` via `core::mem::take`.
+  2. Reniflage zéro-copie d'en-tête de session via `Segment::peek_session`.
+  3. Envoi groupé par lots des trames KISS TCP avec écriture unique `write_all`.
+- [x] **[MINEUR] Fast-path 1 octet pour `sdnv::encode_to_array`, `sdnv::decode` et `kiss::encode_frame`** : Branchements rapides pour valeurs $< 0x80$ et encodage direct de la commande KISS 1 octet.
+
+### 10.5 Conformité au guide de style Hardy (`AGENTS.md`)
+
+- [x] **[MINEUR] Qualification des imports (`use` en 3 blocs et noms courts au site d'usage)** : Organisation stricte des blocs `use` (`std`/`core`/`alloc`, externe, `crate::`/`super::`) et utilisation des identifiants non qualifiés au site d'appel.
+
+### 10.6 Nouveaux scénarios de test de niveau industriel à implémenter
+
+| # | Niveau | Scénario de test | Risque / Défaut ciblé | État |
+|---|--------|------------------|-----------------------|------|
+| S8 | Engine | Configuration avec `max_segment_payload_len = 0` sur `request_transmission` et retransmission | Boucle infinie / OOM (10.1) | **Validé** (`test_s8_zero_max_segment_payload_len_does_not_loop`) |
+| S9 | Engine | Timestamps proches de `u64::MAX` et numéros de série à `u64::MAX` (wrap-around) | Panic par overflow arithmétique ou `NonZeroU64` nul (10.1) | **Validé** (`test_s9_u64_max_timestamp_and_serial_wraparound`) |
+| S10 | Engine | Bloc avec > 25 pertes non contiguës générant > 20 `ReceptionClaim` | Partitionnement en plusieurs `ReportSegment` $\le 20$ claims (10.2) | **Validé** (`test_s10_segmented_reports_max_claims`) |
+| S11 | Engine | Violation d'ordre Red/Green (segment Green avec `offset < red_part_len` ou deux EORP contradictoires) | Détection et annulation `CancelReason::Miscolored` (10.2) | **Validé** (`test_s11_miscolored_detection`) |
+| S12 | Engine | Réception de segments de données ou RS après entrée en état d'annulation (`Rlexc`) | Absence de double notice `Completed` après `Cancelled` (10.2) | **Validé** (`test_s12_cancel_isolation`) |
+| S13 | Engine | Réception d'une rafale de `CancelSender` / `CancelReceiver` dupliqués ou sur session inconnue | Acquittement `CAS`/`CAR` mais 0 ou 1 seule notice `Cancelled` (10.2) | **Validé** (`test_s13_cancel_dedup`) |
+| S14 | Engine | Attaque DoS : 1 segment de 1 octet à `offset = max_block_size - 1` sur 50 sessions simultanées | Consommation RAM minimale (stockage épars sans allocation de 50 × 64 Mio) (10.3) | **Validé** (`test_s14_dos_sparse_offset_memory`) |
+| S15 | Engine | Attaque DoS : inondation de 5000 `SessionId` distincts de 1 octet | Rejet propre au-delà de `max_recv_sessions` sans OOM (10.3) | **Validé** (`test_s15_session_flood_limit`) |
+| S16 | KISS | Décodage d'une rafale de 500 trames KISS concaténées dans un seul tampon TCP | Exactitude du curseur sans déplacement $O(N^2)$ et 0 copie superflue (10.4) | **Validé** (`test_s16_kiss_500_frames_linear`) |
+| S17 | CLA | Multi-pairs sur un même serveur KISS TCP (2 pairs distants échangeant des bundles sans champ `address` explicite) | Résolution dynamique d'`EngineId` et routage multi-stations KISS (10.3) | **Validé** (`test_s17_multi_station_kiss_tcp_peer_resolution`) |
+| S18 | CLA | Arrêt propre (`Shutdown` / `unregister`) pendant un transfert de bloc actif | Notification immédiate `TransferOutcome::Failed` au BPA (10.3) | **Validé** (`test_s18_driver_shutdown_notifies_pending_transfers`) |
+
+

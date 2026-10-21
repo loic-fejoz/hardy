@@ -93,6 +93,30 @@ impl<'a> Segment<'a> {
             cursor.pos,
         ))
     }
+
+    /// Quickly inspects an LTP segment's SessionId from `buf` without allocating any vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] if the control byte or session SDNVs are malformed.
+    pub fn peek_session(buf: &[u8]) -> Result<SessionId, ParseError> {
+        let mut cursor = Cursor { buf, pos: 0 };
+        let control_byte = cursor.u8()?;
+        let version = control_byte >> 4;
+        if version != 0 {
+            return Err(ParseError::BadVersion(version));
+        }
+        let type_code = control_byte & 0x0F;
+        if matches!(type_code, 5 | 6 | 10 | 11) {
+            return Err(ParseError::UndefinedType(type_code));
+        }
+        let originator = EngineId(cursor.sdnv()?);
+        let session_num = cursor.sdnv()?;
+        Ok(SessionId {
+            originator,
+            number: session_num,
+        })
+    }
 }
 
 fn parse_extensions<'a>(

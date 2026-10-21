@@ -45,6 +45,11 @@ pub fn encoded_len(v: u64) -> usize {
 /// Returns the fixed array and the exact number of bytes written (`1..=10`).
 #[must_use]
 pub fn encode_to_array(v: u64) -> ([u8; MAX_LEN], usize) {
+    if v < 0x80 {
+        let mut out = [0u8; MAX_LEN];
+        out[0] = v as u8;
+        return (out, 1);
+    }
     let n = encoded_len(v);
     let mut out = [0u8; MAX_LEN];
     for (i, slot) in out[..n].iter_mut().enumerate() {
@@ -73,6 +78,12 @@ pub fn encode(v: u64, out: &mut Vec<u8>) {
 /// Returns [`Error::Overflow`] if the value exceeds `u64` or requires more
 /// than [`MAX_LEN`] octets.
 pub fn decode(input: &[u8]) -> Result<(u64, usize)> {
+    if let Some(&first) = input.first()
+        && first & 0x80 == 0
+    {
+        return Ok((u64::from(first), 1));
+    }
+
     let mut acc: u64 = 0;
     for (i, &b) in input.iter().enumerate() {
         if i == MAX_LEN {

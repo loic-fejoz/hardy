@@ -19,7 +19,7 @@ pub mod timer;
 
 pub use config::EngineConfig;
 use session::{CheckpointRecord, RecvSession, ReportRecord, SendSession};
-use timer::{TimerKey, TimerTable};
+use timer::{TimerKey, TimerKind, TimerTable};
 
 /// Errors returned by the LTP engine.
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -83,6 +83,14 @@ pub enum Notice {
     },
 }
 
+fn next_nonzero_serial(cur: &mut u64) -> NonZeroU64 {
+    *cur = cur.wrapping_add(1);
+    if *cur == 0 {
+        *cur = 1;
+    }
+    NonZeroU64::new(*cur).expect("non zero")
+}
+
 /// The sans-I/O LTP protocol engine.
 #[derive(Debug)]
 pub struct Engine {
@@ -93,6 +101,8 @@ pub struct Engine {
     timer_table: TimerTable,
     closed_recv_sessions: VecDeque<SessionId>,
     closed_recv_sessions_set: BTreeSet<SessionId>,
+    cancelled_sessions: VecDeque<SessionId>,
+    cancelled_sessions_set: BTreeSet<SessionId>,
     outbound: VecDeque<(EngineId, Vec<u8>)>,
     notices: VecDeque<Notice>,
 }
@@ -110,6 +120,8 @@ impl Engine {
             timer_table: TimerTable::new(),
             closed_recv_sessions: VecDeque::new(),
             closed_recv_sessions_set: BTreeSet::new(),
+            cancelled_sessions: VecDeque::new(),
+            cancelled_sessions_set: BTreeSet::new(),
             outbound: VecDeque::new(),
             notices: VecDeque::new(),
         }
@@ -171,18 +183,17 @@ impl Engine {
             now,
         );
 
-        let mtu = self.config.max_segment_payload_len;
+        let mtu = self.config.max_segment_payload_len.max(1);
         let mut offset = 0u64;
 
         // 1. Segment Red part
         while offset < red_len {
-            let chunk_len = ((red_len - offset) as usize).min(mtu);
+            let chunk_len = (red_len - offset).min(mtu as u64) as usize;
             let end = offset + chunk_len as u64;
             let is_last_red = end == red_len;
 
             let (kind, cp_rec) = if is_last_red {
-                session.last_cp_serial += 1;
-                let serial = NonZeroU64::new(session.last_cp_serial).expect("non zero");
+                let serial = next_nonzero_serial(&mut session.last_cp_serial);
                 let is_eob = end == block_len;
 
                 let cp = Checkpoint {
@@ -226,12 +237,11 @@ impl Engine {
 
             if let Some(record) = cp_rec {
                 session.checkpoints.insert(record.serial.get(), record);
-                let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
+                let deadline = now
+                    .saturating_add(self.config.rtt_micros)
+                    .saturating_add(self.config.ack_margin_micros);
                 self.timer_table.set(
-                    TimerKey::Checkpoint {
-                        session: session_id,
-                        serial: session.last_cp_serial,
-                    },
+                    TimerKey::checkpoint(session_id, session.last_cp_serial),
                     deadline,
                 );
             }
@@ -241,7 +251,7 @@ impl Engine {
 
         // 2. Segment Green part (if any)
         while offset < block_len {
-            let chunk_len = ((block_len - offset) as usize).min(mtu);
+            let chunk_len = (block_len - offset).min(mtu as u64) as usize;
             let end = offset + chunk_len as u64;
             let is_eob = end == block_len;
 
@@ -275,6 +285,13 @@ impl Engine {
                     session: session_id,
                 });
         } else {
+            let inact = self.config.session_inactivity_timeout_micros;
+            if inact > 0 {
+                self.timer_table.set(
+                    TimerKey::inactivity(session_id, true),
+                    now.saturating_add(inact),
+                );
+            }
             self.send_sessions.insert(session_id, session);
         }
 
@@ -391,12 +408,58 @@ impl Engine {
             return;
         }
 
+        // Cancel isolation (RFC 5326 §6.16): discard segments for cancelled sessions
+        if self.cancelled_sessions_set.contains(&session_id) {
+            return;
+        }
+
+        // Cancel isolation: if session exists and is already cancelling, ignore data
+        if let Some(existing) = self.recv_sessions.get(&session_id) {
+            if existing.cancel_reason.is_some() {
+                return;
+            }
+        } else if self.recv_sessions.len() >= self.config.max_recv_sessions {
+            // DoS protection: reject new sessions when capacity is exhausted
+            return;
+        }
+
         let session = self
             .recv_sessions
             .entry(session_id)
             .or_insert_with(|| RecvSession::new(session_id, from, ds.client_service, 0, now));
 
         session.last_activity = now;
+        let inact = self.config.session_inactivity_timeout_micros;
+        if inact > 0 {
+            self.timer_table.set(
+                TimerKey::inactivity(session_id, false),
+                now.saturating_add(inact),
+            );
+        }
+
+        // RFC 5326 §6.21: Red/green ordering violation checks (Miscolored)
+        let seg_end = ds.offset.saturating_add(ds.data.len() as u64);
+        if ds.kind.is_red() {
+            if session.red_part_len.is_some_and(|r| seg_end > r)
+                || session.min_green_offset.is_some_and(|g| seg_end > g)
+                || (ds.kind.is_eorp() && session.red_part_len.is_some_and(|r| r != seg_end))
+            {
+                self.initiate_cancel_receiver(session_id, from, CancelReason::Miscolored, now);
+                return;
+            }
+        } else {
+            session.min_green_offset = Some(
+                session
+                    .min_green_offset
+                    .map_or(ds.offset, |m| m.min(ds.offset)),
+            );
+            if session.red_part_len.is_some_and(|r| ds.offset < r)
+                || ds.offset < session.max_red_end
+            {
+                self.initiate_cancel_receiver(session_id, from, CancelReason::Miscolored, now);
+                return;
+            }
+        }
 
         if ds.kind.is_red() {
             if !session.insert_red(ds.offset, ds.data, self.config.max_block_size) {
@@ -419,53 +482,110 @@ impl Engine {
                     if let Some(&existing_rs) = session.cp_serials_answered.get(&cp_serial) {
                         existing_rs
                     } else {
-                        session.last_report_serial += 1;
-                        let rs_serial = session.last_report_serial;
-                        session.cp_serials_answered.insert(cp_serial, rs_serial);
-                        rs_serial
+                        let serial = next_nonzero_serial(&mut session.last_report_serial).get();
+                        session.cp_serials_answered.insert(cp_serial, serial);
+                        serial
                     };
 
-                let claims: Vec<_> = session
-                    .red_received
-                    .runs_within(0..upper_bound)
-                    .map(|r| ReceptionClaim {
-                        offset: r.start,
-                        length: r.end - r.start,
-                    })
-                    .collect();
+                let all_runs: Vec<_> = session.red_received.runs_within(0..upper_bound).collect();
+                let max_claims = self.config.max_claims_per_report.max(1);
 
-                let report_seg = ReportSegment {
-                    report_serial: NonZeroU64::new(report_serial).expect("non zero"),
-                    checkpoint_serial: cp_serial,
-                    upper_bound,
-                    lower_bound: 0,
-                    claims,
-                };
+                if all_runs.is_empty() {
+                    // Valid report with 0 claims (RFC 5326 §3.2.2)
+                    if session.reports.len() < self.config.max_reports_per_session {
+                        let report_seg = ReportSegment {
+                            report_serial: NonZeroU64::new(report_serial).expect("non zero"),
+                            checkpoint_serial: cp_serial,
+                            upper_bound,
+                            lower_bound: 0,
+                            claims: Vec::new(),
+                        };
 
-                let wire_seg = Segment {
-                    session: session_id,
-                    header_ext: Vec::new(),
-                    trailer_ext: Vec::new(),
-                    body: SegmentBody::Report(report_seg.clone()),
-                };
+                        let wire_seg = Segment {
+                            session: session_id,
+                            header_ext: Vec::new(),
+                            trailer_ext: Vec::new(),
+                            body: SegmentBody::Report(report_seg.clone()),
+                        };
 
-                self.outbound.push_back((from, wire_seg.encode_to_vec()));
+                        self.outbound.push_back((from, wire_seg.encode_to_vec()));
 
-                let record = ReportRecord {
-                    report: report_seg,
-                    retries: 0,
-                    acked: false,
-                };
-                session.reports.insert(report_serial, record);
+                        let record = ReportRecord {
+                            report: report_seg,
+                            retries: 0,
+                            acked: false,
+                        };
+                        session.reports.insert(report_serial, record);
 
-                let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-                self.timer_table.set(
-                    TimerKey::Report {
-                        session: session_id,
-                        serial: report_serial,
-                    },
-                    deadline,
-                );
+                        let deadline = now
+                            .saturating_add(self.config.rtt_micros)
+                            .saturating_add(self.config.ack_margin_micros);
+                        self.timer_table
+                            .set(TimerKey::report(session_id, report_serial), deadline);
+                    }
+                } else {
+                    let chunks: Vec<_> = all_runs.chunks(max_claims).collect();
+                    let num_chunks = chunks.len();
+
+                    for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                        let rs_serial = if chunk_idx == 0 {
+                            report_serial
+                        } else {
+                            next_nonzero_serial(&mut session.last_report_serial).get()
+                        };
+
+                        let lower_bound = if chunk_idx == 0 {
+                            0
+                        } else {
+                            chunk.first().expect("non-empty").start
+                        };
+                        let chunk_upper = if chunk_idx + 1 == num_chunks {
+                            upper_bound
+                        } else {
+                            chunk.last().expect("non-empty").end
+                        };
+
+                        let claims: Vec<_> = chunk
+                            .iter()
+                            .map(|r| ReceptionClaim {
+                                offset: r.start.saturating_sub(lower_bound),
+                                length: r.end.saturating_sub(r.start),
+                            })
+                            .collect();
+
+                        if session.reports.len() < self.config.max_reports_per_session {
+                            let report_seg = ReportSegment {
+                                report_serial: NonZeroU64::new(rs_serial).expect("non zero"),
+                                checkpoint_serial: cp_serial,
+                                upper_bound: chunk_upper,
+                                lower_bound,
+                                claims,
+                            };
+
+                            let wire_seg = Segment {
+                                session: session_id,
+                                header_ext: Vec::new(),
+                                trailer_ext: Vec::new(),
+                                body: SegmentBody::Report(report_seg.clone()),
+                            };
+
+                            self.outbound.push_back((from, wire_seg.encode_to_vec()));
+
+                            let record = ReportRecord {
+                                report: report_seg,
+                                retries: 0,
+                                acked: false,
+                            };
+                            session.reports.insert(rs_serial, record);
+
+                            let deadline = now
+                                .saturating_add(self.config.rtt_micros)
+                                .saturating_add(self.config.ack_margin_micros);
+                            self.timer_table
+                                .set(TimerKey::report(session_id, rs_serial), deadline);
+                        }
+                    }
+                }
             }
         } else {
             self.notices.push_back(Notice::GreenSegmentArrived {
@@ -479,14 +599,61 @@ impl Engine {
 
         if session.is_red_complete() && !session.red_delivered {
             let red_len = session.red_part_len.unwrap_or(0) as usize;
+            session.red_buf.truncate(red_len);
+            let data = core::mem::take(&mut session.red_buf);
             self.notices.push_back(Notice::RedPartReceived {
                 session: session_id,
                 source: from,
                 client_service: session.client_service,
-                data: session.red_buf[..red_len].to_vec(),
+                data,
                 eob: session.red_ends_block,
             });
             session.red_delivered = true;
+        }
+    }
+
+    fn record_cancelled(&mut self, session_id: SessionId) {
+        if self.cancelled_sessions_set.insert(session_id) {
+            self.cancelled_sessions.push_back(session_id);
+            if self.cancelled_sessions.len() > 1024
+                && let Some(old) = self.cancelled_sessions.pop_front()
+            {
+                self.cancelled_sessions_set.remove(&old);
+            }
+        }
+    }
+
+    fn initiate_cancel_receiver(
+        &mut self,
+        session_id: SessionId,
+        peer: EngineId,
+        reason: CancelReason,
+        now: u64,
+    ) {
+        if let Some(session) = self.recv_sessions.get_mut(&session_id) {
+            session.cancel_reason = Some(reason);
+            session.cancel_retries = 1;
+            self.record_cancelled(session_id);
+
+            let cr = Segment {
+                session: session_id,
+                header_ext: Vec::new(),
+                trailer_ext: Vec::new(),
+                body: SegmentBody::CancelReceiver { reason },
+            };
+            self.outbound.push_back((peer, cr.encode_to_vec()));
+
+            let deadline = now
+                .saturating_add(self.config.rtt_micros)
+                .saturating_add(self.config.ack_margin_micros);
+            self.timer_table
+                .set(TimerKey::cancel(session_id, false), deadline);
+
+            self.notices
+                .push_back(Notice::TransmissionSessionCancelled {
+                    session: session_id,
+                    reason,
+                });
         }
     }
 
@@ -509,16 +676,26 @@ impl Engine {
         self.outbound.push_back((from, ra_seg.encode_to_vec()));
 
         // Disarm matching CP timer
-        self.timer_table.cancel(&TimerKey::Checkpoint {
-            session: session_id,
-            serial: rs.checkpoint_serial,
-        });
+        self.timer_table
+            .cancel(&TimerKey::checkpoint(session_id, rs.checkpoint_serial));
 
         let Some(session) = self.send_sessions.get_mut(&session_id) else {
             return;
         };
 
+        if session.cancel_reason.is_some() {
+            return; // Cancel isolation
+        }
+
         session.last_activity = now;
+        let inact = self.config.session_inactivity_timeout_micros;
+        if inact > 0 {
+            self.timer_table.set(
+                TimerKey::inactivity(session_id, true),
+                now.saturating_add(inact),
+            );
+        }
+
         session.checkpoints.remove(&rs.checkpoint_serial);
 
         if !session.report_serials_seen.insert(rs.report_serial.get()) {
@@ -530,14 +707,12 @@ impl Engine {
 
         // Record claimed ranges safely clamped to red_len
         for claim in &rs.claims {
-            if let Some(start) = rs.lower_bound.checked_add(claim.offset)
-                && let Some(end) = start.checked_add(claim.length)
-            {
-                let clamped_start = start.min(red_len);
-                let clamped_end = end.min(red_len);
-                if clamped_start < clamped_end {
-                    session.claims_received.insert(clamped_start..clamped_end);
-                }
+            let start = rs.lower_bound.saturating_add(claim.offset);
+            let end = start.saturating_add(claim.length);
+            let clamped_start = start.min(red_len);
+            let clamped_end = end.min(red_len);
+            if clamped_start < clamped_end {
+                session.claims_received.insert(clamped_start..clamped_end);
             }
         }
 
@@ -554,14 +729,14 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let mtu = self.config.max_segment_payload_len;
+        let mtu = self.config.max_segment_payload_len.max(1);
 
         for (gap_idx, gap) in gaps.iter().enumerate() {
             let is_last_gap = gap_idx + 1 == gaps.len();
             let mut offset = gap.start;
 
             while offset < gap.end {
-                let chunk_len = ((gap.end - offset) as usize).min(mtu);
+                let chunk_len = (gap.end - offset).min(mtu as u64) as usize;
                 let end = offset + chunk_len as u64;
                 let is_final_chunk = is_last_gap && end == gap.end;
 
@@ -569,8 +744,7 @@ impl Engine {
                 let is_eob = end == block_len;
 
                 let (kind, cp_rec) = if is_final_chunk {
-                    session.last_cp_serial += 1;
-                    let serial = NonZeroU64::new(session.last_cp_serial).expect("non zero");
+                    let serial = next_nonzero_serial(&mut session.last_cp_serial);
 
                     let cp = Checkpoint {
                         serial,
@@ -615,12 +789,11 @@ impl Engine {
 
                     if let Some(record) = cp_rec {
                         session.checkpoints.insert(record.serial.get(), record);
-                        let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
+                        let deadline = now
+                            .saturating_add(self.config.rtt_micros)
+                            .saturating_add(self.config.ack_margin_micros);
                         self.timer_table.set(
-                            TimerKey::Checkpoint {
-                                session: session_id,
-                                serial: session.last_cp_serial,
-                            },
+                            TimerKey::checkpoint(session_id, session.last_cp_serial),
                             deadline,
                         );
                     }
@@ -636,8 +809,7 @@ impl Engine {
             && !session.claims_received.covers(&(0..session.red_len))
             && session.checkpoints.is_empty()
         {
-            session.last_cp_serial += 1;
-            let serial = NonZeroU64::new(session.last_cp_serial).expect("non zero");
+            let serial = next_nonzero_serial(&mut session.last_cp_serial);
             let cp_offset = session.red_len.saturating_sub(1);
             let cp_len = if session.red_len > 0 { 1 } else { 0 };
             let is_eob = session.red_len == block_len;
@@ -675,12 +847,11 @@ impl Engine {
                 };
                 self.outbound.push_back((from, seg.encode_to_vec()));
                 session.checkpoints.insert(record.serial.get(), record);
-                let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
+                let deadline = now
+                    .saturating_add(self.config.rtt_micros)
+                    .saturating_add(self.config.ack_margin_micros);
                 self.timer_table.set(
-                    TimerKey::Checkpoint {
-                        session: session_id,
-                        serial: session.last_cp_serial,
-                    },
+                    TimerKey::checkpoint(session_id, session.last_cp_serial),
                     deadline,
                 );
             }
@@ -697,18 +868,28 @@ impl Engine {
     }
 
     fn handle_incoming_report_ack(&mut self, session_id: SessionId, report_serial: u64, now: u64) {
-        self.timer_table.cancel(&TimerKey::Report {
-            session: session_id,
-            serial: report_serial,
-        });
+        self.timer_table
+            .cancel(&TimerKey::report(session_id, report_serial));
 
         if let Some(session) = self.recv_sessions.get_mut(&session_id) {
+            if session.cancel_reason.is_some() {
+                return; // Cancel isolation
+            }
+
             session.last_activity = now;
+            let inact = self.config.session_inactivity_timeout_micros;
+            if inact > 0 {
+                self.timer_table.set(
+                    TimerKey::inactivity(session_id, false),
+                    now.saturating_add(inact),
+                );
+            }
+
             if let Some(rec) = session.reports.get_mut(&report_serial) {
                 rec.acked = true;
                 for claim in &rec.report.claims {
-                    let start = rec.report.lower_bound + claim.offset;
-                    let end = start + claim.length;
+                    let start = rec.report.lower_bound.saturating_add(claim.offset);
+                    let end = start.saturating_add(claim.length);
                     session.reported_coverage.insert(start..end);
                 }
             }
@@ -752,88 +933,106 @@ impl Engine {
         };
         self.outbound.push_back((from, ack_seg.encode_to_vec()));
 
-        self.send_sessions.remove(&session_id);
-        self.recv_sessions.remove(&session_id);
+        let mut notify = false;
+        if let Some(s) = self.send_sessions.remove(&session_id)
+            && s.cancel_reason.is_none()
+        {
+            notify = true;
+        }
+        if let Some(r) = self.recv_sessions.remove(&session_id)
+            && r.cancel_reason.is_none()
+        {
+            notify = true;
+        }
         self.timer_table.cancel_session(session_id);
+        self.record_cancelled(session_id);
 
-        self.notices
-            .push_back(Notice::TransmissionSessionCancelled {
-                session: session_id,
-                reason,
-            });
+        if notify {
+            self.notices
+                .push_back(Notice::TransmissionSessionCancelled {
+                    session: session_id,
+                    reason,
+                });
+        }
     }
 
     fn handle_incoming_cancel_ack(&mut self, session_id: SessionId, is_sender: bool) {
-        self.timer_table.cancel(&TimerKey::Cancel {
-            session: session_id,
-            is_sender,
-        });
+        self.timer_table
+            .cancel(&TimerKey::cancel(session_id, is_sender));
         if is_sender {
             self.send_sessions.remove(&session_id);
         } else {
             self.recv_sessions.remove(&session_id);
         }
         self.timer_table.cancel_session(session_id);
+        self.record_cancelled(session_id);
     }
 
     /// Handles timer expirations and session inactivity timeouts at timestamp `now`.
     pub fn handle_timer_tick(&mut self, now: u64) {
+        let mut expired = Vec::new();
         while let Some(expired_key) = self.timer_table.poll_expired(now) {
-            match expired_key {
-                TimerKey::Checkpoint { session, serial } => {
-                    self.handle_cp_timeout(session, serial, now);
+            expired.push(expired_key);
+        }
+
+        for expired_key in expired {
+            match expired_key.kind {
+                TimerKind::Checkpoint(serial) => {
+                    self.handle_cp_timeout(expired_key.session, serial, now);
                 }
-                TimerKey::Report { session, serial } => {
-                    self.handle_rs_timeout(session, serial, now);
+                TimerKind::Report(serial) => {
+                    self.handle_rs_timeout(expired_key.session, serial, now);
                 }
-                TimerKey::Cancel { session, is_sender } => {
-                    self.handle_cancel_timeout(session, is_sender, now);
+                TimerKind::Cancel { is_sender } => {
+                    self.handle_cancel_timeout(expired_key.session, is_sender, now);
+                }
+                TimerKind::Inactivity { is_sender } => {
+                    self.handle_inactivity_timeout(expired_key.session, is_sender, now);
                 }
             }
         }
+    }
 
-        // Clean up inactive sessions
+    fn handle_inactivity_timeout(&mut self, session_id: SessionId, is_sender: bool, now: u64) {
         let timeout = self.config.session_inactivity_timeout_micros;
-        if timeout > 0 {
-            let mut send_timed_out = Vec::new();
-            for (&id, s) in &self.send_sessions {
-                if now.saturating_sub(s.last_activity) >= timeout {
-                    send_timed_out.push((id, s.peer));
+        if is_sender {
+            if let Some(session) = self.send_sessions.get_mut(&session_id) {
+                if timeout > 0 && now.saturating_sub(session.last_activity) >= timeout {
+                    let peer = session.peer;
+                    self.send_sessions.remove(&session_id);
+                    self.timer_table.cancel_session(session_id);
+                    self.record_cancelled(session_id);
+
+                    let cs = Segment {
+                        session: session_id,
+                        header_ext: Vec::new(),
+                        trailer_ext: Vec::new(),
+                        body: SegmentBody::CancelSender {
+                            reason: CancelReason::Rlexc,
+                        },
+                    };
+                    self.outbound.push_back((peer, cs.encode_to_vec()));
+
+                    self.notices
+                        .push_back(Notice::TransmissionSessionCancelled {
+                            session: session_id,
+                            reason: CancelReason::Rlexc,
+                        });
+                } else if timeout > 0 {
+                    let next_dl = session.last_activity.saturating_add(timeout);
+                    self.timer_table
+                        .set(TimerKey::inactivity(session_id, true), next_dl);
                 }
             }
-            for (id, peer) in send_timed_out {
-                self.send_sessions.remove(&id);
-                self.timer_table.cancel_session(id);
-
-                let cs = Segment {
-                    session: id,
-                    header_ext: Vec::new(),
-                    trailer_ext: Vec::new(),
-                    body: SegmentBody::CancelSender {
-                        reason: CancelReason::Rlexc,
-                    },
-                };
-                self.outbound.push_back((peer, cs.encode_to_vec()));
-
-                self.notices
-                    .push_back(Notice::TransmissionSessionCancelled {
-                        session: id,
-                        reason: CancelReason::Rlexc,
-                    });
-            }
-
-            let mut recv_timed_out = Vec::new();
-            for (&id, s) in &self.recv_sessions {
-                if now.saturating_sub(s.last_activity) >= timeout {
-                    recv_timed_out.push((id, s.peer));
-                }
-            }
-            for (id, peer) in recv_timed_out {
-                self.recv_sessions.remove(&id);
-                self.timer_table.cancel_session(id);
+        } else if let Some(session) = self.recv_sessions.get_mut(&session_id) {
+            if timeout > 0 && now.saturating_sub(session.last_activity) >= timeout {
+                let peer = session.peer;
+                self.recv_sessions.remove(&session_id);
+                self.timer_table.cancel_session(session_id);
+                self.record_cancelled(session_id);
 
                 let cr = Segment {
-                    session: id,
+                    session: session_id,
                     header_ext: Vec::new(),
                     trailer_ext: Vec::new(),
                     body: SegmentBody::CancelReceiver {
@@ -844,9 +1043,13 @@ impl Engine {
 
                 self.notices
                     .push_back(Notice::TransmissionSessionCancelled {
-                        session: id,
+                        session: session_id,
                         reason: CancelReason::Rlexc,
                     });
+            } else if timeout > 0 {
+                let next_dl = session.last_activity.saturating_add(timeout);
+                self.timer_table
+                    .set(TimerKey::inactivity(session_id, false), next_dl);
             }
         }
     }
@@ -854,19 +1057,7 @@ impl Engine {
     /// Returns the timestamp of the earliest pending timer deadline or inactivity timeout, if any.
     #[must_use]
     pub fn next_timer_deadline(&self) -> Option<u64> {
-        let mut earliest = self.timer_table.next_deadline();
-        let timeout = self.config.session_inactivity_timeout_micros;
-        if timeout > 0 {
-            for s in self.send_sessions.values() {
-                let inact_deadline = s.last_activity.saturating_add(timeout);
-                earliest = Some(earliest.map_or(inact_deadline, |e| e.min(inact_deadline)));
-            }
-            for s in self.recv_sessions.values() {
-                let inact_deadline = s.last_activity.saturating_add(timeout);
-                earliest = Some(earliest.map_or(inact_deadline, |e| e.min(inact_deadline)));
-            }
-        }
-        earliest
+        self.timer_table.next_deadline()
     }
 
     fn handle_cp_timeout(&mut self, session_id: SessionId, serial: u64, now: u64) {
@@ -905,14 +1096,11 @@ impl Engine {
 
             self.outbound.push_back((session.peer, seg.encode_to_vec()));
 
-            let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-            self.timer_table.set(
-                TimerKey::Checkpoint {
-                    session: session_id,
-                    serial,
-                },
-                deadline,
-            );
+            let deadline = now
+                .saturating_add(self.config.rtt_micros)
+                .saturating_add(self.config.ack_margin_micros);
+            self.timer_table
+                .set(TimerKey::checkpoint(session_id, serial), deadline);
         } else {
             // Retransmission limit exceeded: initiate cancellation
             let peer = session.peer;
@@ -929,14 +1117,11 @@ impl Engine {
             };
             self.outbound.push_back((peer, cs.encode_to_vec()));
 
-            let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-            self.timer_table.set(
-                TimerKey::Cancel {
-                    session: session_id,
-                    is_sender: true,
-                },
-                deadline,
-            );
+            let deadline = now
+                .saturating_add(self.config.rtt_micros)
+                .saturating_add(self.config.ack_margin_micros);
+            self.timer_table
+                .set(TimerKey::cancel(session_id, true), deadline);
 
             self.notices
                 .push_back(Notice::TransmissionSessionCancelled {
@@ -971,14 +1156,11 @@ impl Engine {
 
             self.outbound.push_back((session.peer, seg.encode_to_vec()));
 
-            let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-            self.timer_table.set(
-                TimerKey::Report {
-                    session: session_id,
-                    serial,
-                },
-                deadline,
-            );
+            let deadline = now
+                .saturating_add(self.config.rtt_micros)
+                .saturating_add(self.config.ack_margin_micros);
+            self.timer_table
+                .set(TimerKey::report(session_id, serial), deadline);
         } else {
             // Retransmission limit exceeded: initiate cancellation
             let peer = session.peer;
@@ -995,14 +1177,11 @@ impl Engine {
             };
             self.outbound.push_back((peer, cr.encode_to_vec()));
 
-            let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-            self.timer_table.set(
-                TimerKey::Cancel {
-                    session: session_id,
-                    is_sender: false,
-                },
-                deadline,
-            );
+            let deadline = now
+                .saturating_add(self.config.rtt_micros)
+                .saturating_add(self.config.ack_margin_micros);
+            self.timer_table
+                .set(TimerKey::cancel(session_id, false), deadline);
 
             self.notices
                 .push_back(Notice::TransmissionSessionCancelled {
@@ -1026,17 +1205,15 @@ impl Engine {
                         },
                     };
                     self.outbound.push_back((session.peer, cs.encode_to_vec()));
-                    let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-                    self.timer_table.set(
-                        TimerKey::Cancel {
-                            session: session_id,
-                            is_sender: true,
-                        },
-                        deadline,
-                    );
+                    let deadline = now
+                        .saturating_add(self.config.rtt_micros)
+                        .saturating_add(self.config.ack_margin_micros);
+                    self.timer_table
+                        .set(TimerKey::cancel(session_id, true), deadline);
                 } else {
                     self.send_sessions.remove(&session_id);
                     self.timer_table.cancel_session(session_id);
+                    self.record_cancelled(session_id);
                 }
             }
         } else if let Some(session) = self.recv_sessions.get_mut(&session_id) {
@@ -1051,17 +1228,15 @@ impl Engine {
                     },
                 };
                 self.outbound.push_back((session.peer, cr.encode_to_vec()));
-                let deadline = now + self.config.rtt_micros + self.config.ack_margin_micros;
-                self.timer_table.set(
-                    TimerKey::Cancel {
-                        session: session_id,
-                        is_sender: false,
-                    },
-                    deadline,
-                );
+                let deadline = now
+                    .saturating_add(self.config.rtt_micros)
+                    .saturating_add(self.config.ack_margin_micros);
+                self.timer_table
+                    .set(TimerKey::cancel(session_id, false), deadline);
             } else {
                 self.recv_sessions.remove(&session_id);
                 self.timer_table.cancel_session(session_id);
+                self.record_cancelled(session_id);
             }
         }
     }
