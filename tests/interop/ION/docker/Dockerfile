@@ -60,6 +60,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 \
+    tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed ION binaries and libraries

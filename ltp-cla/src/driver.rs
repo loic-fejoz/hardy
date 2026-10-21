@@ -174,6 +174,22 @@ impl Driver {
                     // Resolve peer engine ID
                     let peer_engine = if let Some(&id) = self.addr_to_engine.get(&peer_addr) {
                         id
+                    } else if let Ok((seg, _)) = hardy_ltp::segment::Segment::parse(&rx_buf[..len]) {
+                        let id = if seg.session.originator != self.config.engine_id {
+                            seg.session.originator
+                        } else if let Some(peer) = self.engine.peer_for_session(&seg.session) {
+                            peer
+                        } else if self.engine_to_addr.len() == 1 {
+                            *self.engine_to_addr.keys().next().unwrap()
+                        } else {
+                            warn!("received packet from unregistered UDP peer {peer_addr}");
+                            EngineId(peer_addr.port() as u64)
+                        };
+                        // Associate dynamic peer ephemeral port with known engine
+                        if self.engine_to_addr.contains_key(&id) {
+                            self.addr_to_engine.insert(peer_addr, id);
+                        }
+                        id
                     } else {
                         // Dynamic peer discovery from incoming address
                         warn!("received packet from unregistered UDP peer {peer_addr}");

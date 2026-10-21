@@ -1,5 +1,10 @@
 use super::*;
-use hardy_bpa::bpa::BpaRegistration;
+use hardy_bpa::{bpa::BpaRegistration, cla::ClaInit};
+use hardy_ltp::types::EngineId;
+use hardy_ltp_cla::{
+    LtpCla,
+    config::{Config as LtpConfig, PeerEntry, TransportMode},
+};
 
 // Exit codes matching Linux/BSD ping conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,44 +77,6 @@ async fn exec_builtin_cla(
     args: &Command,
     bpa: &alloc::sync::Arc<hardy_bpa::bpa::Bpa>,
 ) -> anyhow::Result<ExitCode> {
-    match args.cla.as_str() {
-        "tcpclv4" => {}
-        other => return Err(anyhow::anyhow!("Unknown built-in CLA: '{other}'")),
-    }
-
-    // ping only dials; never claim the registered listening port
-    let mut builder = hardy_tcpclv4::Tcpclv4::builder();
-
-    // TLS is required as soon as --tls-insecure or --tls-ca asks for it;
-    // the two flags conflict at argument parsing, so at most one is set.
-    // Directory problems surface from build() with pathful messages
-    if args.tls_insecure {
-        builder = builder.tls(
-            hardy_tcpclv4::tls::Tls::builder()
-                .dangerous()
-                .insecure_skip_verify()
-                .required(true)
-                .build()?,
-        );
-    } else if let Some(ca_dir) = &args.tls_ca {
-        builder = builder.tls(
-            hardy_tcpclv4::tls::Tls::builder()
-                .ca_certs(ca_dir.clone())
-                .required(true)
-                .build()?,
-        );
-    }
-
-    let cla = alloc::sync::Arc::new(
-        builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create CLA '{}': {e}", args.cla))?,
-    );
-
-    bpa.register_cla(args.cla.clone(), cla.clone(), None, cla.cla_init())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to start CLA '{}': {e}", args.cla))?;
-
     let peer_addr = if let Some(peer) = &args.peer {
         peer.parse()
             .map_err(|e| anyhow::anyhow!("Failed to parse peer address '{}': {e}", peer))?
@@ -119,21 +86,92 @@ async fn exec_builtin_cla(
         ));
     };
 
-    cla.connect(&peer_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {peer_addr}: {e}"))?;
-    drop(cla);
-
-    // Wait for session registration to complete (async task spawned by connect)
-    // TODO: This should be a proper wait/notification mechanism
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
     let peer: NodeId = args.destination.clone().try_to_node_id().map_err(|_| {
         anyhow::anyhow!(
             "Invalid destination EID {} for ping service",
             args.destination
         )
     })?;
+
+    match args.cla.as_str() {
+        "tcpclv4" => {
+            // ping only dials; never claim the registered listening port
+            let mut builder = hardy_tcpclv4::Tcpclv4::builder();
+
+            // TLS is required as soon as --tls-insecure or --tls-ca asks for it;
+            // the two flags conflict at argument parsing, so at most one is set.
+            // Directory problems surface from build() with pathful messages
+            if args.tls_insecure {
+                builder = builder.tls(
+                    hardy_tcpclv4::tls::Tls::builder()
+                        .dangerous()
+                        .insecure_skip_verify()
+                        .required(true)
+                        .build()?,
+                );
+            } else if let Some(ca_dir) = &args.tls_ca {
+                builder = builder.tls(
+                    hardy_tcpclv4::tls::Tls::builder()
+                        .ca_certs(ca_dir.clone())
+                        .required(true)
+                        .build()?,
+                );
+            }
+
+            let cla = alloc::sync::Arc::new(
+                builder
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("Failed to create CLA '{}': {e}", args.cla))?,
+            );
+
+            bpa.register_cla(args.cla.clone(), cla.clone(), None, cla.cla_init())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start CLA '{}': {e}", args.cla))?;
+
+            cla.connect(&peer_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to connect to {peer_addr}: {e}"))?;
+            drop(cla);
+
+            // Wait for session registration to complete (async task spawned by connect)
+            // TODO: This should be a proper wait/notification mechanism
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        "ltp" => {
+            let local_node = args.node_id()?;
+            let local_engine = match local_node {
+                NodeId::Ipn(ipn) => EngineId(ipn.node_number as u64),
+                _ => EngineId(1),
+            };
+            let peer_engine = match &peer {
+                NodeId::Ipn(ipn) => EngineId(ipn.node_number as u64),
+                _ => EngineId(2),
+            };
+            let bind_addr = args
+                .cla_bind
+                .unwrap_or_else(|| "0.0.0.0:1113".parse().expect("valid socket address"));
+
+            let config = LtpConfig {
+                engine_id: local_engine,
+                transport: TransportMode::Udp { bind_addr },
+                peers: vec![PeerEntry {
+                    engine_id: peer_engine,
+                    address: Some(peer_addr),
+                    node_id: Some(peer.clone()),
+                }],
+                ..Default::default()
+            };
+
+            let cla = alloc::sync::Arc::new(LtpCla::new(config));
+            bpa.register_cla(args.cla.clone(), cla.clone(), None, ClaInit::default())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start CLA '{}': {e}", args.cla))?;
+
+            // Give the driver a moment to bind and register peers
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        other => return Err(anyhow::anyhow!("Unknown built-in CLA: '{other}'")),
+    }
 
     // Now add a route if we are targeting a service
     if args.destination.service().is_some() {

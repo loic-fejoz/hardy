@@ -200,11 +200,16 @@ Pour valider la conformité RFC 5326 sans attendre le CLA réseau ni de conteneu
 - *Test UDP* : Deux instances de BPA écoutant sur des ports UDP éphémères `127.0.0.1:0`. Routage d'un bundle complet vers l'EID distant et vérification des retours [`ForwardBundleResult::Accepted`](file:///home/loic/projets/hardy/bpa/src/cla/mod.rs#L195) et [`TransferOutcome::Completed`](file:///home/loic/projets/hardy/bpa/src/cla/mod.rs#L211).
 - *Test KISS* : Démarrage d'une tâche serveur TCP locale simulant un TNC KISS, vérification de la bonne connexion du client CLA Hardy, du tramage correct et de l'échange de bundles.
 
-### 5.5 Niveau 5 : Validation d'Interopérabilité Externe
+### 5.5 Niveau 5 : Validation d'Interopérabilité Externe (ION-DTN & Wireshark)
 
-- Lancement d'un conteneur Docker éphémère exécutant `ion-dtn` configuré avec LTP over UDP (port 1113).
-- Émission et réception bidirectionnelle de bundles entre Hardy et ION.
-- Capture Wireshark (`.pcap`) et validation via le dissecteur Wireshark (`packet-ltp.c`) sans anomalie signalée.
+- **Environnement** : Image Docker officielle ION 4.1.4 (`ion-interop`) exécutée en local sur le port UDP 1113.
+- **Échanges testés (`tests/interop/ION/test_ion_ltp_ping.sh`)** :
+  - *Test 1 (Hardy -> ION)* : Outil CLI `bp ping` de Hardy configuré avec `--cla ltp` vers le service echo ION (`ipn:2.7`), 5/5 bundles acheminés avec succès, 0% de perte, RTT ~1.4 ms.
+  - *Test 2 (ION -> Hardy)* : `bpsendfile` et `bpecho` depuis ION vers Hardy (`ipn:1.7`), 5/5 bundles reçus et acquittés sans perte.
+- **Validation dissection Wireshark/tshark (`packet-ltp.c`)** :
+  - Capture en direct `.pcap` via `tcpdump`.
+  - Dissection complète sous `tshark` confirmant l'absence de toute malformation sur les segments LTP échangés (Red Data, Checkpoint, Report Segments, Report ACKs).
+- **Adaptation ports éphémères UDP** : Détection et apprentissage dynamique des ports éphémères source d'ION (`udplso`) pour l'association des sessions entrantes/sortantes.
 
 ---
 
@@ -316,7 +321,7 @@ cargo bench -p hardy-ltp
 - [x] **Niveau 3bis** : Validation d'interopérabilité croisée avec `licklider-core` (`ltp/tests/interop_licklider.rs` : double sens Hardy <-> Licklider nominal et sous 15% de perte).
 - [x] **Niveau 4** : Adaptateur CLA Hardy BPA (`hardy-ltp-cla` avec UDP RFC 7122 et KISS TCP, validé en boucle locale).
 - [x] **Intégration & Configurabilité** : Support de `type: ltp` dans la configuration YAML de `hardy-bpa-server`, parsing serde avec `humantime`, tests unitaires de configuration et fichier d'exemple `ltp-cla/example_config.yaml`.
-- [ ] **Niveau 5** : Tests d'interopérabilité externe (ION-DTN).
+- [x] **Niveau 5** : Tests d'interopérabilité externe (ION-DTN 4.1.4, ping bidirectionnel 100% réussi, dissection Wireshark/tshark validée).
 
 ---
 
@@ -383,4 +388,5 @@ Revue approfondie du code de `ltp/` et `ltp-cla/` (branche `feat/ltp-cla`) avec 
 | S4 | Engine | Rapport sans claim (`claim_count == 0`) conforme RFC 5326 | Rejet invalide (9.2) | **Validé** (`test_report_with_zero_claims_rfc_compliant`) |
 | S5 | KISS | Séquence d'échappement invalide au milieu d'un flux valide | Blocage flux KISS (9.4) | **Validé** (`skip_corrupted_escape_frames_and_recover`) |
 | S6 | Interop | Altération 15% perte, duplication, gigue Hardy ↔ Licklider | Correction protocolaire | **Validé** (tests `interop_licklider`) |
+| S7 | Interop | Ping bidirectionnel Hardy ↔ ION 4.1.4 + capture Wireshark | Interopérabilité RFC 5326 / RFC 7122 | **Validé** (`test_ion_ltp_ping.sh`) |
 

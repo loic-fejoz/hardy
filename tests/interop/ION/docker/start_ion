@@ -13,17 +13,33 @@
 
 set -e
 
+if [ "$1" = "tcpdump" ]; then
+    exec "$@"
+fi
+
+CLA_TYPE=${CLA_TYPE:-stcp}
 ION_NODE_NUM=${ION_NODE_NUM:-2}
 STCP_PORT=${STCP_PORT:-4557}
+LTP_PORT=${LTP_PORT:-1113}
 REMOTE_HOST=${REMOTE_HOST:-}
 REMOTE_PORT=${REMOTE_PORT:-4557}
 REMOTE_NODE=${REMOTE_NODE:-1}
+LTP_ENGINE_NUM=${LTP_ENGINE_NUM:-$ION_NODE_NUM}
+REMOTE_LTP_ENGINE=${REMOTE_LTP_ENGINE:-$REMOTE_NODE}
 
 echo "ION Interop Testing"
+echo "  CLA:         $CLA_TYPE"
 echo "  Node:        ipn:$ION_NODE_NUM.0"
-echo "  STCP:        port $STCP_PORT"
-if [ -n "$REMOTE_HOST" ]; then
-    echo "  Remote:      $REMOTE_HOST:$REMOTE_PORT (ipn:$REMOTE_NODE.0)"
+if [ "$CLA_TYPE" = "ltp" ]; then
+    echo "  LTP Engine:  $LTP_ENGINE_NUM (UDP port $LTP_PORT)"
+    if [ -n "$REMOTE_HOST" ]; then
+        echo "  Remote LTP:  $REMOTE_HOST:$REMOTE_PORT (engine $REMOTE_LTP_ENGINE, node ipn:$REMOTE_NODE.0)"
+    fi
+else
+    echo "  STCP:        port $STCP_PORT"
+    if [ -n "$REMOTE_HOST" ]; then
+        echo "  Remote STCP: $REMOTE_HOST:$REMOTE_PORT (ipn:$REMOTE_NODE.0)"
+    fi
 fi
 echo ""
 
@@ -38,10 +54,6 @@ echo ""
 # initialization (wmKey=65281, sdrName="ion"). Each container runs a single
 # ION instance so there's no collision risk.
 
-# Create ION configuration files
-# wmKey and sdrName MUST match ION's compiled-in defaults (65281 and "ion").
-# All fields must be specified — ION zero-initializes unspecified fields
-# rather than using defaults when an ionconfig file is provided.
 cat > /ion/ion.ionconfig << EOF
 wmKey 65281
 sdrName ion
@@ -71,8 +83,54 @@ cat > /ion/ion.ionsecrc << EOF
 1
 EOF
 
-# Build bprc with STCP protocol
-cat > /ion/ion.bprc << EOF
+if [ "$CLA_TYPE" = "ltp" ]; then
+    # Build ltprc for LTP over UDP
+    cat > /ion/ion.ltprc << EOF
+1 100
+EOF
+    if [ -n "$REMOTE_HOST" ]; then
+        cat >> /ion/ion.ltprc << EOF
+a span ${REMOTE_LTP_ENGINE} 100 100 1400 1 1 'udplso ${REMOTE_HOST}:${REMOTE_PORT} ${REMOTE_LTP_ENGINE}' 1
+EOF
+    fi
+    cat >> /ion/ion.ltprc << EOF
+s 'udplsi 0.0.0.0:${LTP_PORT}'
+EOF
+
+    # Build bprc with LTP protocol
+    cat > /ion/ion.bprc << EOF
+1
+a scheme ipn 'ipnfw' 'ipnadminep'
+a endpoint ipn:${ION_NODE_NUM}.0 x
+a endpoint ipn:${ION_NODE_NUM}.1 x
+a endpoint ipn:${ION_NODE_NUM}.7 x
+a protocol ltp 1400 100 -1
+a induct ltp ${LTP_ENGINE_NUM} 'ltpcli ${LTP_ENGINE_NUM}'
+EOF
+
+    if [ -n "$REMOTE_HOST" ]; then
+        cat >> /ion/ion.bprc << EOF
+a outduct ltp ${REMOTE_LTP_ENGINE} 'ltpclo ${REMOTE_LTP_ENGINE}'
+EOF
+    fi
+
+    cat >> /ion/ion.bprc << EOF
+r 'ipnadmin ion.ipnrc'
+s
+EOF
+
+    # Build ipnrc with route to remote node via LTP
+    cat > /ion/ion.ipnrc << EOF
+EOF
+    if [ -n "$REMOTE_HOST" ]; then
+        cat >> /ion/ion.ipnrc << EOF
+a plan ${REMOTE_NODE} ltp/${REMOTE_LTP_ENGINE}
+EOF
+    fi
+
+else
+    # Build bprc with STCP protocol
+    cat > /ion/ion.bprc << EOF
 1
 a scheme ipn 'ipnfw' 'ipnadminep'
 a endpoint ipn:${ION_NODE_NUM}.0 x
@@ -82,32 +140,29 @@ a protocol stcp 1400 100 -1
 a induct stcp 0.0.0.0:${STCP_PORT} stcpcli
 EOF
 
-# Add outduct to remote node if configured
-if [ -n "$REMOTE_HOST" ]; then
-    cat >> /ion/ion.bprc << EOF
+    if [ -n "$REMOTE_HOST" ]; then
+        cat >> /ion/ion.bprc << EOF
 a outduct stcp ${REMOTE_HOST}:${REMOTE_PORT} stcpclo
 EOF
-fi
+    fi
 
-cat >> /ion/ion.bprc << EOF
+    cat >> /ion/ion.bprc << EOF
 r 'ipnadmin ion.ipnrc'
 s
 EOF
 
-# Build ipnrc with route to remote node
-cat > /ion/ion.ipnrc << EOF
+    cat > /ion/ion.ipnrc << EOF
 EOF
-
-if [ -n "$REMOTE_HOST" ]; then
-    cat >> /ion/ion.ipnrc << EOF
+    if [ -n "$REMOTE_HOST" ]; then
+        cat >> /ion/ion.ipnrc << EOF
 a plan ${REMOTE_NODE} stcp/${REMOTE_HOST}:${REMOTE_PORT}
 EOF
+    fi
 fi
 
 echo "Starting ION..."
 
 # Clean up any stale ION shared memory/semaphores from previous runs.
-# With --ipc=host, these persist across container restarts.
 echo "Cleaning stale ION IPC state..."
 killm 2>/dev/null || true
 sleep 1
@@ -116,17 +171,23 @@ sleep 1
 cd /ion
 ionadmin ion.ionrc
 ionsecadmin ion.ionsecrc
+if [ "$CLA_TYPE" = "ltp" ]; then
+    echo "Configuring LTP in ION..."
+    ltpadmin ion.ltprc
+fi
 bpadmin ion.bprc
 
 echo "ION started successfully"
 echo "  Local EID:   ipn:${ION_NODE_NUM}.0"
-echo "  STCP port:   ${STCP_PORT}"
+if [ "$CLA_TYPE" = "ltp" ]; then
+    echo "  LTP port:    ${LTP_PORT}"
+else
+    echo "  STCP port:   ${STCP_PORT}"
+fi
 
-# Keep the container running - ION runs as background daemons
-# Wait for any signal to shut down
-trap 'echo "Shutting down ION..."; bpadmin . 2>/dev/null; ionadmin . 2>/dev/null; killm 2>/dev/null; exit 0' SIGTERM SIGINT
+# Keep container running
+trap 'echo "Shutting down ION..."; bpadmin . 2>/dev/null; if [ "$CLA_TYPE" = "ltp" ]; then ltpadmin . 2>/dev/null; fi; ionadmin . 2>/dev/null; killm 2>/dev/null; exit 0' SIGTERM SIGINT
 
-# Block forever (ION daemons run in background)
 while true; do
     sleep 3600 &
     wait $!

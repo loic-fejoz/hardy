@@ -118,9 +118,13 @@ pub struct Command {
     /// Peer address (host:port) for built-in CLAs
     peer: Option<String>,
 
-    /// CLA to use: built-in name (tcpclv4) or path to an external CLA binary
+    /// CLA to use: built-in name (tcpclv4, ltp) or path to an external CLA binary
     #[arg(long, default_value = "tcpclv4")]
     cla: String,
+
+    /// Local bind address for CLA (defaults to 0.0.0.0:1113 for LTP)
+    #[arg(long = "cla-bind")]
+    cla_bind: Option<std::net::SocketAddr>,
 
     /// Arguments to pass to the external CLA binary (use with --cla /path/to/binary)
     #[arg(long = "cla-args", allow_hyphen_values = true)]

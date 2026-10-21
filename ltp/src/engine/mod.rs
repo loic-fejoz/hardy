@@ -281,6 +281,12 @@ impl Engine {
         Ok(session_id)
     }
 
+    /// Returns the destination peer engine ID for an active send session, if known.
+    #[must_use]
+    pub fn peer_for_session(&self, session_id: &SessionId) -> Option<EngineId> {
+        self.send_sessions.get(session_id).map(|s| s.peer)
+    }
+
     /// Processes an incoming raw LTP segment received from `from`.
     ///
     /// # Errors
@@ -294,36 +300,46 @@ impl Engine {
     ) -> Result<()> {
         let (segment, _) = Segment::parse(segment_bytes)?;
 
+        // Resolve effective peer engine ID from session context if available,
+        // supporting dynamic/ephemeral transport ports from known peers.
+        let effective_from = if segment.session.originator != self.config.engine_id {
+            segment.session.originator
+        } else if let Some(send_sess) = self.send_sessions.get(&segment.session) {
+            send_sess.peer
+        } else {
+            from
+        };
+
         match segment.body {
             SegmentBody::Data(ds) => {
-                if segment.session.originator != from {
+                if segment.session.originator != effective_from {
                     return Ok(());
                 }
-                self.handle_incoming_data(from, segment.session, ds, now);
+                self.handle_incoming_data(effective_from, segment.session, ds, now);
             }
             SegmentBody::Report(rs) => {
                 if segment.session.originator != self.config.engine_id {
                     return Ok(());
                 }
-                self.handle_incoming_report(from, segment.session, rs, now);
+                self.handle_incoming_report(effective_from, segment.session, rs, now);
             }
             SegmentBody::ReportAck { report_serial } => {
-                if segment.session.originator != from {
+                if segment.session.originator != effective_from {
                     return Ok(());
                 }
                 self.handle_incoming_report_ack(segment.session, report_serial, now);
             }
             SegmentBody::CancelSender { reason } => {
-                if segment.session.originator != from {
+                if segment.session.originator != effective_from {
                     return Ok(());
                 }
-                self.handle_incoming_cancel(from, segment.session, reason, true);
+                self.handle_incoming_cancel(effective_from, segment.session, reason, true);
             }
             SegmentBody::CancelReceiver { reason } => {
                 if segment.session.originator != self.config.engine_id {
                     return Ok(());
                 }
-                self.handle_incoming_cancel(from, segment.session, reason, false);
+                self.handle_incoming_cancel(effective_from, segment.session, reason, false);
             }
             SegmentBody::CancelAckSender => {
                 if segment.session.originator != self.config.engine_id {
@@ -332,7 +348,7 @@ impl Engine {
                 self.handle_incoming_cancel_ack(segment.session, true);
             }
             SegmentBody::CancelAckReceiver => {
-                if segment.session.originator != from {
+                if segment.session.originator != effective_from {
                     return Ok(());
                 }
                 self.handle_incoming_cancel_ack(segment.session, false);
