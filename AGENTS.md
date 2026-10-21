@@ -10,9 +10,10 @@ The workspace is split into many small crates. The ones you will touch most ofte
 - `bpv7/` — RFC 9171 bundle format: parsing, building, editing, BPSec (`no_std`).
 - `bpa/` — the Bundle Processing Agent library: routing, dispatch, filter pipeline, RIB, storage/CLA/service registries.
 - `bpa-server/` — the binary that wires the BPA together; closed-source extensions register against the **unmodified** `bpa` crate via public traits.
+- `ltp/` — RFC 5326 Licklider Transmission Protocol engine and codecs (`no_std`).
 - `eid-patterns/`, `async/`, `proto/`, `otel/` — supporting libraries.
 - `*-storage/` — pluggable storage backends (localdisk, sqlite, postgres, s3).
-- `tcpclv4/`, `file-cla/`, `bibe/` — convergence layers; `tvr/` — Time-Variant Routing agent.
+- `tcpclv4/`, `file-cla/`, `bibe/`, `ltp-cla/` — convergence layers (TCPCLv4, file, BIBE, RFC 7122 LTP/UDP and raw KISS TCP); `tvr/` — Time-Variant Routing agent.
 - `tools/`, `bpv7/tools/`, `cbor/tools/` — CLI tools (`bp`, `bundle`, `cbor`).
 
 `tests/interop/mtcp` is excluded from the workspace and built separately.
@@ -49,7 +50,8 @@ Full reference: [`docs/style_guides/code_style_guide.md`](./docs/style_guides/co
 - **Set visibility at the definition.** Use `pub`/`pub(crate)` on the item itself; do not widen or narrow it via re-exports elsewhere. Inside a private or `pub(crate)` module, write plain `pub`, not redundant `pub(crate)`.
 - **32-bit safe.** Hardy targets 32-bit. Never `as usize` a wire-derived `u64` length — compare in `u64` first, then `try_from`.
 - **Errors are `thiserror` enums** with a `#[error("…")]` per variant; modules expose `pub type Result<T> = core::result::Result<T, Error>`. Give sub-parsers focused leaf error types rather than reusing a crate-root `Error`.
-- **`no_std` core.** `cbor`, `bpv7`, and `bpa` are `no_std` + `alloc`; gate `std` behind a feature, don't assume it.
+- **`no_std` core.** `cbor`, `bpv7`, `bpa`, and `ltp` are `no_std` + `alloc`; gate `std` behind a feature, don't assume it.
+- **KISS transport.** In KISS-based convergence layers, raw protocol frames (such as LTP segments) are framed directly into KISS Data frames (Command 0) without AX.25 encapsulation headers.
 - **Secrets never reach `Display`, `Debug`, or logs — no exceptions.** Raw symmetric key bytes live only in `bpsec::key::SecretBytes` (self-redacting, zeroized on drop); other secret types (tokens, credentials) MUST have a redacting `Debug` (length or kid, never bytes), MUST NOT be interpolated into error messages, and MUST keep raw bytes in `zeroize::Zeroizing`.
 - **Cryptographic hygiene — no exceptions.** MAC/tag/signature verification MUST be constant-time (the primitive's verify API, never `==`); cryptographic randomness MUST come from `SysRng` (a non-crypto PRNG only for non-security values, with a comment saying so); plaintext key material MUST NOT transit unzeroized buffers, including error paths.
 - **Comments describe the present.** No "moved from / replaces the old X / now takes Y" porting narration — git holds that history.
