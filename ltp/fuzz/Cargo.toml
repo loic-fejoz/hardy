@@ -1,0 +1,42 @@
+[package]
+name = "hardy-ltp-fuzz"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+hardy-ltp = { path = "..", features = ["std", "kiss"] }
+libfuzzer-sys = "0.4"
+
+[lib]
+name = "hardy_ltp_fuzz"
+path = "src/lib.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "segment_decode"
+path = "fuzz_targets/segment_decode.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "sdnv_kiss"
+path = "fuzz_targets/sdnv_kiss.rs"
+test = false
+bench = false
+doc = false
+
+[[bin]]
+name = "engine_ops"
+path = "fuzz_targets/engine_ops.rs"
+test = false
+bench = false
+doc = false

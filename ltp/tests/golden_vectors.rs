@@ -3,6 +3,7 @@
 use core::num::NonZeroU64;
 use std::vec::Vec;
 
+use hardy_ltp::sdnv;
 use hardy_ltp::segment::{
     Checkpoint, DataSegKind, ParseError, ReceptionClaim, Segment, SegmentBody,
 };
@@ -293,5 +294,39 @@ fn reject_malformed_segments() {
     assert_eq!(
         Segment::parse(&res_reason),
         Err(ParseError::ReservedReason(6))
+    );
+}
+
+#[test]
+fn test_peek_session() {
+    // Valid segment: control byte 0x00 (type 0, version 0), originator 42, session 7
+    let valid = unhex("00 2a 07 00 01 00 00");
+    assert_eq!(
+        Segment::peek_session(&valid),
+        Ok(hardy_ltp::types::SessionId {
+            originator: EngineId(42),
+            number: 7,
+        })
+    );
+
+    // Bad version: version 1 (0x10)
+    let bad_ver = unhex("10 2a 07 00");
+    assert_eq!(
+        Segment::peek_session(&bad_ver),
+        Err(ParseError::BadVersion(1))
+    );
+
+    // Undefined type code: type 5
+    let bad_type = vec![0x05, 0x2a, 0x07];
+    assert_eq!(
+        Segment::peek_session(&bad_type),
+        Err(ParseError::UndefinedType(5))
+    );
+
+    // Truncated buffer
+    assert_eq!(Segment::peek_session(&[]), Err(ParseError::Truncated));
+    assert_eq!(
+        Segment::peek_session(&[0x00]),
+        Err(ParseError::Sdnv(sdnv::Error::Truncated))
     );
 }

@@ -1,0 +1,23 @@
+# cargo-mutants configuration for Hardy DTN Router
+# See https://mutants.rs/
+
+# Additional test arguments
+additional_cargo_test_args = ["--", "--nocapture"]
+
+# Timeout margins to avoid false positives on busy build machines
+timeout_multiplier = 2.0
+minimum_test_timeout = 10.0
+
+# Skip mutating pure display/debug/error formatting boilerplate
+exclude_re = [
+    ".*Display::fmt.*",
+    ".*Debug::fmt.*",
+    ".*Error::fmt.*",
+]
+
+# Standard calls skipped during mutation
+skip_calls = [
+    "with_capacity",
+    "reserve",
+    "clone",
+]

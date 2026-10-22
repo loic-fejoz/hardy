@@ -2250,6 +2250,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hardy-ltp-cla-fuzz"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "hardy-bpa",
+ "hardy-bpv7",
+ "hardy-ltp",
+ "hardy-ltp-cla",
+ "libfuzzer-sys",
+ "tokio",
+]
+
+[[package]]
+name = "hardy-ltp-fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "bytes",
+ "hardy-ltp",
+ "libfuzzer-sys",
+]
+
+[[package]]
 name = "hardy-otel"
 version = "0.2.0"
 dependencies = [
