@@ -44,6 +44,15 @@ pub enum DriverCommand {
     Shutdown,
 }
 
+#[derive(Debug)]
+struct GreenReassembly {
+    _source: EngineId,
+    data: Vec<u8>,
+    received_bytes: usize,
+    total_len: Option<usize>,
+    last_update: Instant,
+}
+
 /// The background task running the LTP engine.
 pub struct Driver {
     config: Config,
@@ -56,6 +65,7 @@ pub struct Driver {
     addr_to_engine: HashMap<SocketAddr, EngineId>,
     engine_to_node: HashMap<EngineId, NodeId>,
     pending_transfers: HashMap<SessionId, Id>,
+    green_reassemblies: HashMap<SessionId, GreenReassembly>,
 }
 
 impl Driver {
@@ -92,6 +102,7 @@ impl Driver {
                 addr_to_engine: HashMap::new(),
                 engine_to_node: HashMap::new(),
                 pending_transfers: HashMap::new(),
+                green_reassemblies: HashMap::new(),
             };
 
             if let Err(err) = driver.run(addr_tx).await {
@@ -622,8 +633,85 @@ impl Driver {
                         });
                     }
                 }
-                Notice::GreenSegmentArrived { .. } => {
-                    // Unreliable green segments
+                Notice::GreenSegmentArrived {
+                    session,
+                    source,
+                    offset,
+                    data,
+                    eob,
+                } => {
+                    let sink = self.sink.clone();
+                    let peer_node = self.engine_to_node.get(&source).cloned();
+                    let peer_addr = engine_id_to_cla_address(source);
+
+                    if offset == 0 && eob {
+                        // Single-segment green block (fast-path)
+                        self.tasks.spawn(async move {
+                            debug!(
+                                "delivering single-segment green bundle ({} bytes) from Engine {:?}",
+                                data.len(),
+                                source
+                            );
+                            let mut bundle_stream = Bytes::from(data);
+                            let _ = sink
+                                .dispatch(peer_node.as_ref(), Some(&peer_addr), &mut bundle_stream)
+                                .await;
+                        });
+                    } else {
+                        // Multi-segment green block reassembly
+                        let entry = self.green_reassemblies.entry(session).or_insert_with(|| {
+                            GreenReassembly {
+                                _source: source,
+                                data: Vec::new(),
+                                received_bytes: 0,
+                                total_len: None,
+                                last_update: Instant::now(),
+                            }
+                        });
+
+                        entry.last_update = Instant::now();
+                        let end_offset = offset as usize + data.len();
+                        if entry.data.len() < end_offset {
+                            entry.data.resize(end_offset, 0);
+                        }
+                        entry.data[offset as usize..end_offset].copy_from_slice(&data);
+                        entry.received_bytes += data.len();
+                        if eob {
+                            entry.total_len = Some(end_offset);
+                        }
+
+                        if let Some(total) = entry.total_len
+                            && entry.received_bytes >= total
+                            && entry.data.len() == total
+                        {
+                            let complete_data = std::mem::take(&mut entry.data);
+                            self.green_reassemblies.remove(&session);
+
+                            self.tasks.spawn(async move {
+                                debug!(
+                                    "delivering reassembled green bundle ({} bytes) from Engine {:?}",
+                                    complete_data.len(),
+                                    source
+                                );
+                                let mut bundle_stream = Bytes::from(complete_data);
+                                let _ = sink
+                                    .dispatch(
+                                        peer_node.as_ref(),
+                                        Some(&peer_addr),
+                                        &mut bundle_stream,
+                                    )
+                                    .await;
+                            });
+                        }
+
+                        // Periodic cleanup of stale green reassemblies (older than 30s)
+                        if self.green_reassemblies.len() > 128 {
+                            let now = Instant::now();
+                            self.green_reassemblies.retain(|_, r| {
+                                now.duration_since(r.last_update) < Duration::from_secs(30)
+                            });
+                        }
+                    }
                 }
             }
         }

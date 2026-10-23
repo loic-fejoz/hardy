@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -11,7 +11,9 @@ use tracing::{debug, info};
 
 use hardy_async::TaskPool;
 use hardy_bpa::async_trait;
-use hardy_bpa::cla::{Cla, ClaAddress, ForwardBundleResult, Result as ClaResult, Segment, Sink};
+use hardy_bpa::cla::{
+    Cla, ClaAddress, ClaInit, ForwardBundleResult, Result as ClaResult, Segment, Sink,
+};
 use hardy_bpa::stream::{Receiver, buffer_stream};
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
@@ -72,6 +74,20 @@ impl LtpCla {
         let inner_guard = self.inner.read().await;
         let inner = inner_guard.as_ref().ok_or(Error::NotRegistered)?;
         Ok(inner.local_addr)
+    }
+
+    /// Returns the initialisation parameters for registering this CLA with the BPA.
+    ///
+    /// Declares 2 lanes:
+    /// - Lane 0: Red data (reliable, fully acknowledged)
+    /// - Lane 1: Green data (unreliable datagram, no acknowledgments)
+    #[must_use]
+    pub fn cla_init(&self) -> ClaInit {
+        ClaInit {
+            address_type: None,
+            lane_count: NonZeroU32::new(2),
+            max_bundle_size: None,
+        }
     }
 
     /// Registers a peer address to Engine ID mapping and notifies the driver.
@@ -223,7 +239,7 @@ impl Cla for LtpCla {
 
     async fn forward(
         &self,
-        _lane: Option<u32>,
+        lane: Option<u32>,
         cla_addr: &ClaAddress,
         bundle_id: &Id,
         total_len: u64,
@@ -251,8 +267,16 @@ impl Cla for LtpCla {
             }
         };
 
+        // Reliability class mapping via lanes:
+        // - Lane 1: Green data (unreliable datagram, red_len = 0)
+        // - Lane 0 / None: Red data (reliable transfer, red_len = total_len)
+        let red_len = match lane {
+            Some(1) => 0,
+            _ => total_len,
+        };
+
         debug!(
-            "buffering bundle {bundle_id} ({total_len} bytes) for LTP transmission to {destination_engine:?}"
+            "buffering bundle {bundle_id} ({total_len} bytes, red_len {red_len}) for LTP transmission to {destination_engine:?}"
         );
         let bundle_bytes = buffer_stream(stream, total_len).await?;
 
@@ -262,7 +286,7 @@ impl Cla for LtpCla {
                 bundle_id: bundle_id.clone(),
                 destination_engine,
                 data: bundle_bytes,
-                red_len: total_len, // Entire bundle is sent reliably as Red data
+                red_len,
                 reply_tx,
             })
             .await

@@ -3,7 +3,7 @@
 //! Tests UDP datagram transport (RFC 7122) and KISS over TCP transport
 //! using local loopback and mock BPA sinks.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 use std::vec::Vec;
 
@@ -1660,4 +1660,171 @@ async fn test_canonical_ltp_address_resolution() {
     assert_eq!(cla_address_to_engine_id(&dummy_addr), None);
     let short_private = ClaAddress::Private(Bytes::from_static(&[1, 2, 3]));
     assert_eq!(cla_address_to_engine_id(&short_private), None);
+}
+
+#[tokio::test]
+async fn test_ltp_cla_init_lane_count() {
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    let init = cla.cla_init();
+    assert_eq!(init.lane_count, NonZeroU32::new(2));
+    assert_eq!(init.address_type, None);
+}
+
+#[tokio::test]
+async fn test_udp_cla_green_data_transfer() {
+    let (disp_tx_1, mut _disp_rx_1) = mpsc::channel(16);
+    let (outc_tx_1, mut outc_rx_1) = mpsc::channel(16);
+    let sink_1 = Box::new(MockSink {
+        dispatches: disp_tx_1,
+        outcomes: outc_tx_1,
+    });
+
+    let (disp_tx_2, mut disp_rx_2) = mpsc::channel(16);
+    let (outc_tx_2, mut _outc_rx_2) = mpsc::channel(16);
+    let sink_2 = Box::new(MockSink {
+        dispatches: disp_tx_2,
+        outcomes: outc_tx_2,
+    });
+
+    let cfg_1 = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_1 = LtpCla::new(cfg_1);
+    cla_1.on_register(sink_1, &[], None).await;
+    let addr_1 = cla_1.local_addr().await.unwrap();
+
+    let cfg_2 = Config {
+        engine_id: EngineId(2),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_2 = LtpCla::new(cfg_2);
+    cla_2.on_register(sink_2, &[], None).await;
+    let addr_2 = cla_2.local_addr().await.unwrap();
+
+    let node_id_1: NodeId = "dtn://node-1/".parse().unwrap();
+    let node_id_2: NodeId = "dtn://node-2/".parse().unwrap();
+
+    cla_1
+        .register_peer(EngineId(2), addr_2, Some(node_id_2.clone()))
+        .await
+        .unwrap();
+    cla_2
+        .register_peer(EngineId(1), addr_1, Some(node_id_1.clone()))
+        .await
+        .unwrap();
+
+    // 1. Single-segment green bundle (lane = Some(1))
+    let single_payload = vec![0x42u8; 128];
+    let single_hash = Sha256::digest(&single_payload);
+    let bundle_id_single = create_test_bundle_id("green-single");
+    let mut stream_single = Bytes::copy_from_slice(&single_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(2)),
+            &bundle_id_single,
+            single_payload.len() as u64,
+            &mut stream_single,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Verify dispatch at Node 2
+    let (_, _, received_single) = tokio::time::timeout(Duration::from_secs(5), disp_rx_2.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(Sha256::digest(&received_single), single_hash);
+
+    // Verify immediate completion outcome at Node 1
+    let (outcome_id, outcome) = tokio::time::timeout(Duration::from_secs(5), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(outcome_id, bundle_id_single);
+    assert_eq!(outcome, TransferOutcome::Completed);
+
+    // 2. Multi-segment green bundle (lane = Some(1), 5 KiB over 1024 MTU)
+    let multi_payload = vec![0x77u8; 5120];
+    let multi_hash = Sha256::digest(&multi_payload);
+    let bundle_id_multi = create_test_bundle_id("green-multi");
+    let mut stream_multi = Bytes::copy_from_slice(&multi_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(2)),
+            &bundle_id_multi,
+            multi_payload.len() as u64,
+            &mut stream_multi,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    let (_, _, received_multi) = tokio::time::timeout(Duration::from_secs(5), disp_rx_2.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(Sha256::digest(&received_multi), multi_hash);
+
+    let (outcome_id, outcome) = tokio::time::timeout(Duration::from_secs(5), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(outcome_id, bundle_id_multi);
+    assert_eq!(outcome, TransferOutcome::Completed);
+
+    // 3. Verify that Green data on Lane 1 completes immediately without waiting for any ACKs
+    let dummy_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dummy_addr = dummy_rx.local_addr().unwrap();
+    cla_1
+        .register_peer(EngineId(99), dummy_addr, None)
+        .await
+        .unwrap();
+
+    let unacked_payload = vec![0x99u8; 64];
+    let unacked_id = create_test_bundle_id("unacked-green");
+    let mut unacked_stream = Bytes::copy_from_slice(&unacked_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(99)),
+            &unacked_id,
+            unacked_payload.len() as u64,
+            &mut unacked_stream,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Must complete immediately without any remote acknowledgments
+    let (out_id, out) = tokio::time::timeout(Duration::from_millis(500), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(out_id, unacked_id);
+    assert_eq!(out, TransferOutcome::Completed);
+
+    cla_1.unregister().await;
+    cla_2.unregister().await;
 }
