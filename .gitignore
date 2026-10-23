@@ -10,6 +10,8 @@ bpa-server/certs/
 # MkDocs
 /site/
 /.venv/
+__pycache__/
+*.pyc
 
 # External references and RFCs
 /references/

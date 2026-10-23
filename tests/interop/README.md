@@ -18,6 +18,7 @@ Hardy is tested against 7 peer implementations. Each test verifies bidirectional
 | [ud3tn](ud3tn/) | MTCP (via mtcp-cla) | AAP2 echo agent (service 7) | Passing | [README](ud3tn/README.md) |
 | [ESA BP](ESA-BP/) | STCP (via mtcp-cla) | STCP CLE + echo (service 7) | Passing | [README](ESA-BP/README.md) |
 | [NASA cFS](NASA-cFS/) | STCP (via mtcp-cla) | SB routing echo (service 7) | Passing | [README](NASA-cFS/README.md) |
+| [Scapy LTP](scapy-ltp/) | LTP/UDP | Built-in (service 7) + RFC 5326 suite | Passing | [README](scapy-ltp/README.md) |
 
 ## Running
 
@@ -37,6 +38,7 @@ Results are saved to `interop_results.md`.
 ./tests/interop/HDTN/test_hdtn_ping.sh
 ./tests/interop/HDTN/test_hdtn_ping.sh --skip-build --count 10
 ./tests/interop/ION/test_ion_ltp_ping.sh     # NASA JPL ION via LTP/UDP
+./tests/interop/scapy-ltp/run_scapy_tests.sh # Scapy LTP packet injection & RFC suite
 ```
 
 All test scripts support `--skip-build`, `--refresh` (rebuild the peer's Docker image from scratch), and `--count N`.
