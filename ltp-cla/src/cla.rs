@@ -29,6 +29,7 @@ struct ClaInner {
     tasks: Arc<TaskPool>,
     cmd_tx: mpsc::Sender<DriverCommand>,
     local_addr: SocketAddr,
+    max_bundle_size: Option<NonZeroU64>,
     _driver_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -144,7 +145,7 @@ impl Cla for LtpCla {
         &self,
         sink: Box<dyn Sink>,
         _node_ids: &[NodeId],
-        _max_bundle_size: Option<NonZeroU64>,
+        max_bundle_size: Option<NonZeroU64>,
     ) {
         info!(
             "registering LTP CLA (Engine ID {}) with BPA",
@@ -223,6 +224,7 @@ impl Cla for LtpCla {
             tasks,
             cmd_tx,
             local_addr,
+            max_bundle_size,
             _driver_handle: driver_handle,
         });
     }
@@ -245,13 +247,22 @@ impl Cla for LtpCla {
         total_len: u64,
         stream: &mut dyn Receiver<Segment>,
     ) -> ClaResult<ForwardBundleResult> {
-        let cmd_tx = {
+        let (cmd_tx, max_bundle_size) = {
             let inner_guard = self.inner.read().await;
             let inner = inner_guard
                 .as_ref()
                 .ok_or(hardy_bpa::cla::Error::Disconnected)?;
-            inner.cmd_tx.clone()
+            (inner.cmd_tx.clone(), inner.max_bundle_size)
         };
+
+        if let Some(cap) = max_bundle_size
+            && total_len > cap.get()
+        {
+            return Err(hardy_bpa::cla::Error::PayloadTooLarge {
+                size: total_len,
+                max: cap.get(),
+            });
+        }
 
         // Resolve destination EngineId
         let destination_engine = {

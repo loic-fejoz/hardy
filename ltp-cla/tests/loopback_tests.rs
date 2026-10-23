@@ -1828,3 +1828,149 @@ async fn test_udp_cla_green_data_transfer() {
     cla_1.unregister().await;
     cla_2.unregister().await;
 }
+
+#[tokio::test]
+async fn test_max_bundle_size_enforcement() {
+    let (disp_tx, _) = mpsc::channel(16);
+    let (outc_tx, _) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    // Register with a cap of 1000 bytes
+    cla.on_register(sink, &[], NonZeroU64::new(1000)).await;
+
+    // 1. Bundle of 1500 bytes exceeds the cap -> rejected
+    let big_payload = vec![0xEEu8; 1500];
+    let big_bundle = create_test_bundle_id("too-big");
+    let mut big_stream = Bytes::copy_from_slice(&big_payload);
+
+    let err = match cla
+        .forward(
+            None,
+            &engine_id_to_cla_address(EngineId(2)),
+            &big_bundle,
+            big_payload.len() as u64,
+            &mut big_stream,
+        )
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected forward to fail with PayloadTooLarge"),
+    };
+
+    match err {
+        hardy_bpa::cla::Error::PayloadTooLarge { size, max } => {
+            assert_eq!(size, 1500);
+            assert_eq!(max, 1000);
+        }
+        other => panic!("expected PayloadTooLarge, got: {other:?}"),
+    }
+
+    // 2. Bundle of exactly 1000 bytes (boundary condition: total_len == cap) -> accepted
+    let exact_payload = vec![0xDDu8; 1000];
+    let exact_bundle = create_test_bundle_id("exact-cap");
+    let mut exact_stream = Bytes::copy_from_slice(&exact_payload);
+
+    let res = cla
+        .forward(
+            Some(1),
+            &engine_id_to_cla_address(EngineId(2)),
+            &exact_bundle,
+            exact_payload.len() as u64,
+            &mut exact_stream,
+        )
+        .await
+        .expect("exact cap bundle must be accepted");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    cla.unregister().await;
+}
+
+struct PeerTrackingSink {
+    peers_added: mpsc::Sender<(ClaAddress, Vec<NodeId>)>,
+}
+
+#[async_trait]
+impl Sink for PeerTrackingSink {
+    async fn unregister(&self) {}
+    async fn dispatch(
+        &self,
+        _: Option<&NodeId>,
+        _: Option<&ClaAddress>,
+        _: &mut dyn Receiver<Segment>,
+    ) -> ClaResult<Acceptance> {
+        Ok(Acceptance::Accepted)
+    }
+    async fn add_peer(&self, addr: ClaAddress, nodes: &[NodeId]) -> ClaResult<bool> {
+        let _ = self.peers_added.send((addr, nodes.to_vec())).await;
+        Ok(true)
+    }
+    async fn remove_peer(&self, _: &ClaAddress) -> ClaResult<bool> {
+        Ok(true)
+    }
+    async fn transfer_outcome(&self, _: &Id, _: TransferOutcome) -> ClaResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_dynamic_peer_discovery_registers_with_sink() {
+    let (peer_tx, mut peer_rx) = mpsc::channel(16);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: peer_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(), // No pre-configured peers
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+    let local_addr = cla.local_addr().await.unwrap();
+
+    // Unknown station (Engine 77) sends an LTP green segment to Node 1 via raw UDP socket
+    let remote_engine = EngineId(77);
+    let ltp_seg = LtpSegment {
+        session: SessionId {
+            originator: remote_engine,
+            number: 1,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::GreenEob,
+            data: &[0xAA; 32],
+        }),
+    };
+    let raw_bytes = ltp_seg.encode_to_vec();
+
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client_sock.send_to(&raw_bytes, local_addr).await.unwrap();
+
+    // Node 1 driver must dynamically discover Engine 77 and register it via sink.add_peer
+    let (discovered_addr, nodes) = tokio::time::timeout(Duration::from_secs(5), peer_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must discover and add peer");
+
+    assert_eq!(discovered_addr, engine_id_to_cla_address(remote_engine));
+    assert!(nodes.is_empty());
+
+    cla.unregister().await;
+}

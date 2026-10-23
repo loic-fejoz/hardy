@@ -231,13 +231,20 @@ impl Driver {
                             warn!("received packet from unregistered UDP peer {peer_addr}");
                             EngineId(peer_addr.port() as u64)
                         };
-                        // Associate dynamic peer ephemeral port with known engine, limiting table size
-                        if self.engine_to_addr.contains_key(&id) {
-                            if self.addr_to_engine.len() >= 1024 {
-                                self.addr_to_engine.clear();
-                            }
-                            self.addr_to_engine.insert(peer_addr, id);
-                            self.engine_to_addr.insert(id, peer_addr);
+                        let is_new_peer = !self.engine_to_addr.contains_key(&id);
+                        if self.addr_to_engine.len() >= 1024 {
+                            self.addr_to_engine.clear();
+                        }
+                        self.addr_to_engine.insert(peer_addr, id);
+                        self.engine_to_addr.insert(id, peer_addr);
+
+                        if is_new_peer {
+                            info!("discovered new dynamic LTP peer Engine {id:?} at {peer_addr}");
+                            let cla_addr = engine_id_to_cla_address(id);
+                            let sink = self.sink.clone();
+                            self.tasks.spawn(async move {
+                                let _ = sink.add_peer(cla_addr, &[]).await;
+                            });
                         }
                         id
                     } else {
