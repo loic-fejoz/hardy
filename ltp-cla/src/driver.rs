@@ -11,7 +11,7 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
-use hardy_bpa::cla::{Acceptance, ClaAddress, ForwardBundleResult, Sink, TransferOutcome};
+use hardy_bpa::cla::{Acceptance, ForwardBundleResult, Sink, TransferOutcome};
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
 use hardy_ltp::engine::{Engine, EngineConfig, Notice};
@@ -19,6 +19,7 @@ use hardy_ltp::kiss::{Command, decode_frame, encode_frame};
 use hardy_ltp::segment::Segment;
 use hardy_ltp::types::{EngineId, SessionId};
 
+use crate::cla::engine_id_to_cla_address;
 use crate::config::{Config, TransportMode};
 use crate::error::{Error, Result};
 
@@ -554,10 +555,7 @@ impl Driver {
                         continue;
                     }
                     let peer_node = self.engine_to_node.get(&source);
-                    let peer_addr = self
-                        .engine_to_addr
-                        .get(&source)
-                        .map(|s| ClaAddress::Tcp(*s));
+                    let peer_addr = engine_id_to_cla_address(source);
 
                     debug!(
                         "delivering received bundle ({} bytes) from Engine {:?}",
@@ -567,7 +565,7 @@ impl Driver {
                     let mut bundle_stream = Bytes::from(data);
                     match self
                         .sink
-                        .dispatch(peer_node, peer_addr.as_ref(), &mut bundle_stream)
+                        .dispatch(peer_node, Some(&peer_addr), &mut bundle_stream)
                         .await
                     {
                         Ok(Acceptance::Accepted) => {}

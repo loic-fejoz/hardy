@@ -28,6 +28,25 @@ struct ClaInner {
     _driver_handle: tokio::task::JoinHandle<()>,
 }
 
+/// Converts an LTP [`EngineId`] into its canonical Hardy [`ClaAddress`].
+#[must_use]
+pub fn engine_id_to_cla_address(engine_id: EngineId) -> ClaAddress {
+    ClaAddress::Private(Bytes::copy_from_slice(&engine_id.0.to_be_bytes()))
+}
+
+/// Attempts to parse an LTP [`EngineId`] from a [`ClaAddress`].
+#[must_use]
+pub fn cla_address_to_engine_id(cla_addr: &ClaAddress) -> Option<EngineId> {
+    match cla_addr {
+        ClaAddress::Private(b) if b.len() == 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(b);
+            Some(EngineId(u64::from_be_bytes(arr)))
+        }
+        _ => None,
+    }
+}
+
 /// The Licklider Transmission Protocol Convergence Layer Adapter.
 pub struct LtpCla {
     config: Config,
@@ -60,11 +79,12 @@ impl LtpCla {
         addr: SocketAddr,
         node_id: Option<NodeId>,
     ) -> Result<()> {
-        let cla_addr = ClaAddress::Tcp(addr);
-        self.peer_mappings
-            .write()
-            .await
-            .insert(cla_addr.clone(), engine_id);
+        let cla_addr = engine_id_to_cla_address(engine_id);
+        {
+            let mut mappings = self.peer_mappings.write().await;
+            mappings.insert(cla_addr.clone(), engine_id);
+            mappings.insert(ClaAddress::Tcp(addr), engine_id);
+        }
 
         let inner_guard = self.inner.read().await;
         if let Some(inner) = inner_guard.as_ref() {
@@ -135,15 +155,14 @@ impl Cla for LtpCla {
         };
 
         for peer in &self.config.peers {
-            let cla_addr = if let Some(addr) = peer.address {
-                ClaAddress::Tcp(addr)
-            } else {
-                ClaAddress::Private(Bytes::copy_from_slice(&peer.engine_id.0.to_be_bytes()))
-            };
-            self.peer_mappings
-                .write()
-                .await
-                .insert(cla_addr.clone(), peer.engine_id);
+            let cla_addr = engine_id_to_cla_address(peer.engine_id);
+            {
+                let mut mappings = self.peer_mappings.write().await;
+                mappings.insert(cla_addr.clone(), peer.engine_id);
+                if let Some(addr) = peer.address {
+                    mappings.insert(ClaAddress::Tcp(addr), peer.engine_id);
+                }
+            }
             if let Some(ref node_id) = peer.node_id {
                 let _ = sink.add_peer(cla_addr, std::slice::from_ref(node_id)).await;
             }
@@ -211,20 +230,12 @@ impl Cla for LtpCla {
             let mappings = self.peer_mappings.read().await;
             if let Some(&id) = mappings.get(cla_addr) {
                 id
+            } else if let Some(id) = cla_address_to_engine_id(cla_addr) {
+                id
             } else {
-                match cla_addr {
-                    ClaAddress::Tcp(addr) => EngineId(addr.port() as u64),
-                    ClaAddress::Private(b) if b.len() == 8 => {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(b);
-                        EngineId(u64::from_be_bytes(arr))
-                    }
-                    _ => {
-                        return Err(hardy_bpa::cla::Error::from(
-                            crate::error::Error::UnknownPeer(cla_addr.clone()),
-                        ));
-                    }
-                }
+                return Err(hardy_bpa::cla::Error::from(
+                    crate::error::Error::UnknownPeer(cla_addr.clone()),
+                ));
             }
         };
 

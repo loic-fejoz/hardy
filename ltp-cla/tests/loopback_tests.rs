@@ -25,7 +25,10 @@ use hardy_ltp::segment::{
     Checkpoint, DataSegKind, DataSegment, Segment as LtpSegment, SegmentBody,
 };
 use hardy_ltp::types::{CancelReason, SessionId};
-use hardy_ltp_cla::{Config, EngineId, LtpCla, PeerEntry, TransportMode};
+use hardy_ltp_cla::{
+    Config, EngineId, LtpCla, PeerEntry, TransportMode, cla_address_to_engine_id,
+    engine_id_to_cla_address,
+};
 
 /// Mock BPA sink capturing dispatches and transfer outcomes.
 struct MockSink {
@@ -184,7 +187,10 @@ async fn test_udp_cla_nominal_transfer() {
             .expect("must receive dispatched bundle");
 
     assert_eq!(received_peer_node.as_ref(), Some(&node_id_1));
-    assert_eq!(received_peer_addr, Some(ClaAddress::Tcp(addr_1)));
+    assert_eq!(
+        received_peer_addr,
+        Some(engine_id_to_cla_address(EngineId(1)))
+    );
     assert_eq!(Sha256::digest(&received_bytes), expected_hash);
 
     // Wait for Node 1 to receive confirmation outcome
@@ -1641,4 +1647,17 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
 
     cla_1.unregister().await;
     cla_2.unregister().await;
+}
+
+#[tokio::test]
+async fn test_canonical_ltp_address_resolution() {
+    let eid = EngineId(0x1234_5678_9ABC_DEF0);
+    let cla_addr = engine_id_to_cla_address(eid);
+    assert_eq!(cla_address_to_engine_id(&cla_addr), Some(eid));
+
+    // Unknown address formats fail resolution
+    let dummy_addr = ClaAddress::Tcp("127.0.0.1:9600".parse().unwrap());
+    assert_eq!(cla_address_to_engine_id(&dummy_addr), None);
+    let short_private = ClaAddress::Private(Bytes::from_static(&[1, 2, 3]));
+    assert_eq!(cla_address_to_engine_id(&short_private), None);
 }

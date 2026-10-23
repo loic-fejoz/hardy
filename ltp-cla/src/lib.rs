@@ -5,7 +5,7 @@ pub mod config;
 pub mod driver;
 pub mod error;
 
-pub use cla::LtpCla;
+pub use cla::{LtpCla, cla_address_to_engine_id, engine_id_to_cla_address};
 pub use config::{Config, PeerEntry, TransportMode};
 pub use error::{Error, Result};
 pub use hardy_ltp::types::EngineId;
