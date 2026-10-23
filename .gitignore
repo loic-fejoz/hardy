@@ -13,3 +13,7 @@ bpa-server/certs/
 
 # External references and RFCs
 /references/
+
+# Mutation testing artifacts
+mutants.out/
+mutants.out.*/

@@ -184,6 +184,7 @@ mod tests {
         let mut set = RangeSet::new();
         set.insert(10..20);
         set.insert(30..40);
+        assert_eq!(set.run_count(), 2);
 
         let gaps: Vec<_> = set.gaps(0..50).collect();
         assert_eq!(gaps, alloc::vec![0..10, 20..30, 40..50]);

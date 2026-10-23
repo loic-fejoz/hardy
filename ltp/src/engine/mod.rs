@@ -328,29 +328,38 @@ impl Engine {
         };
 
         match segment.body {
+            // RFC 5326 §3.2: Segments sent by block sender to block receiver
             SegmentBody::Data(ds) => {
-                if segment.session.originator != effective_from {
+                if segment.session.originator == self.config.engine_id {
                     return Ok(());
                 }
                 self.handle_incoming_data(effective_from, segment.session, ds, now);
             }
-            SegmentBody::Report(rs) => {
-                if segment.session.originator != self.config.engine_id {
-                    return Ok(());
-                }
-                self.handle_incoming_report(effective_from, segment.session, rs, now);
-            }
             SegmentBody::ReportAck { report_serial } => {
-                if segment.session.originator != effective_from {
+                if segment.session.originator == self.config.engine_id {
                     return Ok(());
                 }
                 self.handle_incoming_report_ack(segment.session, report_serial, now);
             }
             SegmentBody::CancelSender { reason } => {
-                if segment.session.originator != effective_from {
+                if segment.session.originator == self.config.engine_id {
                     return Ok(());
                 }
                 self.handle_incoming_cancel(effective_from, segment.session, reason, true);
+            }
+            SegmentBody::CancelAckReceiver => {
+                if segment.session.originator == self.config.engine_id {
+                    return Ok(());
+                }
+                self.handle_incoming_cancel_ack(segment.session, false);
+            }
+
+            // RFC 5326 §3.2: Segments sent by block receiver to block sender
+            SegmentBody::Report(rs) => {
+                if segment.session.originator != self.config.engine_id {
+                    return Ok(());
+                }
+                self.handle_incoming_report(effective_from, segment.session, rs, now);
             }
             SegmentBody::CancelReceiver { reason } => {
                 if segment.session.originator != self.config.engine_id {
@@ -363,12 +372,6 @@ impl Engine {
                     return Ok(());
                 }
                 self.handle_incoming_cancel_ack(segment.session, true);
-            }
-            SegmentBody::CancelAckReceiver => {
-                if segment.session.originator != effective_from {
-                    return Ok(());
-                }
-                self.handle_incoming_cancel_ack(segment.session, false);
             }
         }
 

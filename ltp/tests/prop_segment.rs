@@ -6,7 +6,9 @@ use std::vec::Vec;
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::*;
 
-use hardy_ltp::segment::{Checkpoint, DataSegKind, DataSegment, Segment, SegmentBody};
+use hardy_ltp::segment::{
+    Checkpoint, DataSegKind, DataSegment, ReceptionClaim, ReportSegment, Segment, SegmentBody,
+};
 use hardy_ltp::types::{CancelReason, EngineId, SessionId};
 
 // Generators for arbitrary valid Segment structures
@@ -39,6 +41,40 @@ fn arb_data_kind() -> impl Strategy<Value = DataSegKind> {
         Just(DataSegKind::Green),
         Just(DataSegKind::GreenEob),
     ]
+}
+
+fn arb_report_segment() -> impl Strategy<Value = ReportSegment> {
+    (
+        1u64..=u64::MAX,
+        any::<u64>(),
+        0u64..=1_000_000,
+        1u64..=50_000,
+    )
+        .prop_flat_map(|(raw_serial, cp_serial, lower_bound, scope)| {
+            let upper_bound = lower_bound + scope;
+            prop_vec((1u64..=1000, 0u64..=1000), 0..=8).prop_map(move |items| {
+                let mut claims = Vec::new();
+                let mut current_offset = 0;
+                for (len, gap) in items {
+                    if current_offset + len <= scope {
+                        claims.push(ReceptionClaim {
+                            offset: current_offset,
+                            length: len,
+                        });
+                        current_offset += len + gap;
+                    } else {
+                        break;
+                    }
+                }
+                ReportSegment {
+                    report_serial: NonZeroU64::new(raw_serial).unwrap(),
+                    checkpoint_serial: cp_serial,
+                    upper_bound,
+                    lower_bound,
+                    claims,
+                }
+            })
+        })
 }
 
 proptest! {
@@ -144,5 +180,56 @@ proptest! {
 
         prop_assert_eq!(consumed, encoded.len());
         prop_assert_eq!(decoded.body, seg.body);
+    }
+
+    #[test]
+    fn report_segment_roundtrip(
+        session in arb_session_id(),
+        report in arb_report_segment(),
+    ) {
+        let seg = Segment {
+            session,
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: SegmentBody::Report(report),
+        };
+
+        let encoded = seg.encode_to_vec();
+        prop_assert_eq!(
+            encoded.len(),
+            seg.exact_encoded_len(&seg.header_ext, &seg.trailer_ext)
+        );
+
+        let (decoded, consumed) = Segment::parse(&encoded).expect("valid report segment must parse");
+
+        prop_assert_eq!(consumed, encoded.len());
+        prop_assert_eq!(decoded.session, seg.session);
+        prop_assert_eq!(decoded.type_code(), seg.type_code());
+        prop_assert_eq!(decoded.body, seg.body);
+    }
+
+    #[test]
+    fn report_segment_bounds_invariant_rejected(
+        lower in 100u64..=1000,
+        upper in 0u64..=100,
+    ) {
+        let seg = ReportSegment {
+            report_serial: NonZeroU64::new(1).unwrap(),
+            checkpoint_serial: 0,
+            upper_bound: upper,
+            lower_bound: lower,
+            claims: Vec::new(),
+        };
+        let s = Segment {
+            session: SessionId {
+                originator: EngineId(1),
+                number: 1,
+            },
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: SegmentBody::Report(seg),
+        };
+        let encoded = s.encode_to_vec();
+        prop_assert!(Segment::parse(&encoded).is_err());
     }
 }

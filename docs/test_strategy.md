@@ -38,6 +38,8 @@ This Strategy is the parent document. Verification is executed according to the 
 | **BTP-U** | Unit | [`UTP-BTPU-01`](../btpu/docs/unit_test_plan.md) | Draft-04 framing, segmentation, reassembly, window, and receiver limits. |
 | **BTP-U** | Fuzz | [`FUZZ-BTPU-01`](../btpu/docs/fuzz_test_plan.md) | PDU decoding, receiver state robustness, and the sender's guarantees under arbitrary call sequences. |
 | **TCPCLv4 Server** | System | [`PLAN-TCPCL-SERVER-01`](../tcpclv4-server/docs/test_plan.md) | Application lifecycle, config, packaging. |
+| **LTP** | Fuzz | [`FUZZ-LTP-01`](../ltp/docs/fuzz_test_plan.md) | RFC 5326 segment parsing, SDNV, KISS framing, engine robustness. |
+| **LTP** | Mutation | [`MUT-LTP-01`](../ltp/docs/mutation_test_plan.md) | Fault injection on state machine, timers, codecs via `cargo-mutants`. |
 | **CLA Trait** | Integration | [`PLAN-CLA-01`](../bpa/docs/cla_integration_test_plan.md) | Generic Convergence Layer Trait verification. |
 | **Service Trait** | Integration | [`PLAN-SVC-01`](../bpa/docs/service_integration_test_plan.md) | Generic Application Service Trait verification. |
 | **Storage** | Integration | [`PLAN-STORE-01`](../tests/storage/docs/test_plan.md) | Generic Storage Trait verification. |

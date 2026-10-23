@@ -1,0 +1,51 @@
+# LTP fuzzing dictionary: SDNV boundaries, segment type octets, reason codes, KISS framing.
+
+# segment type codes (octet 0, version nibble 0)
+type_red="\x00"
+type_red_cp="\x01"
+type_red_cp_eorp="\x02"
+type_red_cp_eorp_eob="\x03"
+type_green="\x04"
+type_green_eob="\x07"
+type_rs="\x08"
+type_ra="\x09"
+type_cs="\x0c"
+type_cas="\x0d"
+type_cr="\x0e"
+type_car="\x0f"
+type_undef_5="\x05"
+type_undef_10="\x0a"
+bad_version="\x10"
+
+# SDNV boundary values
+sdnv_zero="\x00"
+sdnv_127="\x7f"
+sdnv_128="\x81\x00"
+sdnv_16383="\xff\x7f"
+sdnv_rfc_example="\xa4\x34"
+sdnv_pad="\x80\x80\x01"
+sdnv_u64_max="\x81\xff\xff\xff\xff\xff\xff\xff\xff\x7f"
+sdnv_overflow="\x82\x80\x80\x80\x80\x80\x80\x80\x80\x00"
+sdnv_dangling="\x80"
+
+# cancel reason codes
+reason_usr="\x00"
+reason_rlexc="\x02"
+reason_miscolored="\x03"
+reason_reserved="\x06"
+reason_ff="\xff"
+
+# extension tags
+ext_auth="\x00"
+ext_cookie="\x01"
+ext_unknown="\x42"
+
+# extension count nibbles
+ext_1h_1t="\x11"
+ext_15h_15t="\xff"
+
+# KISS framing octets
+kiss_fend="\xc0"
+kiss_fesc="\xdb"
+kiss_tfend="\xdc"
+kiss_tfesc="\xdd"

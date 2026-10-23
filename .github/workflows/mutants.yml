@@ -1,0 +1,72 @@
+name: Mutation Testing
+
+on:
+  pull_request:
+    paths:
+      - "ltp/**"
+      - "ltp-cla/**"
+      - ".cargo/mutants.toml"
+      - ".github/workflows/mutants.yml"
+  schedule:
+    # Run every Sunday at 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package to mutate (or 'all')"
+        required: false
+        default: "hardy-ltp"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Use cached dependencies and artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+
+      - name: Cache cargo-mutants binary
+        id: cache-mutants-bin
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: cargo-mutants-bin-27.1.0
+
+      - name: Install cargo-mutants
+        if: steps.cache-mutants-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-mutants --version 27.1.0 --locked
+
+      - name: Run mutation testing (PR incremental)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff
+          cargo mutants -p hardy-ltp -p hardy-ltp-cla --in-diff /tmp/pr.diff
+
+      - name: Run mutation testing (Full scheduled / manual)
+        if: github.event_name != 'pull_request'
+        run: |
+          TARGET="${{ github.event.inputs.package || 'hardy-ltp' }}"
+          if [ "$TARGET" = "all" ]; then
+            cargo mutants -p hardy-ltp -p hardy-ltp-cla
+          else
+            cargo mutants -p "$TARGET"
+          fi
