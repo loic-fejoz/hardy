@@ -35,6 +35,20 @@ The testbed exercises 10 comprehensive protocol scenarios:
 | 9 | `test_09_fuzzing_and_malformed_packets_resilience` | RFC 5326 / RFC 7122 | Injection of truncated, malformed SDNVs, undefined flags (5, 10, 11), and random noise without engine panic |
 | 10 | `test_10_bidirectional_bp_echo_over_ltp` | RFC 9171 / RFC 5326 | End-to-end bidirectional BPv7 bundle exchange: Scapy crafts CBOR bundle to `ipn:1.7`, Hardy echoes it back over LTP |
 
+## Design Rationale: Strictness vs. Postel's Principle in DTN
+
+When crafting test bundles in Python (`ltp_harness.py`), Hardy strictly enforces RFC 9171 ingress validation. For example, encoding bundles with a definite-length CBOR array (`0x82...`) or using an unclocked timestamp (`[0, seq]`) without a Bundle Age block causes Hardy to reject the bundle at ingress with `Bundle violates RFC 9171 canonical CBOR encoding requirements` or `Rejecting bundle: no clock in creation timestamp and no Bundle Age block`.
+
+While Postel's Robustness Principle (*"Be conservative in what you do, be liberal in what you accept from others"*, RFC 760 / RFC 1122) historically encouraged accepting non-conformant inputs, Hardy adheres to modern protocol maintenance principles defined in [RFC 9413 (*Maintaining Robust Protocols*)](https://www.rfc-editor.org/rfc/rfc9413.html) for several critical reasons:
+
+1. **BPSec Cryptographic Signature Preservation (RFC 9172 / RFC 9173):** BPSec Block Integrity Blocks (BIB) compute cryptographic hashes and MACs over the exact byte-for-byte canonical CBOR representation. If an intermediate DTN node accepts a non-canonical bundle and canonicalizes it upon forwarding, the cryptographic signature is permanently corrupted for all downstream recipients.
+2. **Deep-Space Store-and-Forward Fail-Fast:** In high-delay space networks (e.g. Earth to Mars), storing and forwarding a malformed bundle across multi-hop links consumes precious bandwidth, storage, and battery power, only to be rejected upon arrival at a strict destination node. Rejecting non-compliant bundles immediately at ingress (*fail-fast*) prevents costly network resource exhaustion.
+3. **Storage Exhaustion Prevention:** RFC 9171 §4.2.6 mandates that bundles without a synchronized creation timestamp must carry a Bundle Age extension block. Without a clock or an age counter, nodes cannot compute bundle expiration or enforce retention timeouts, creating a denial-of-service vulnerability against constrained onboard storage.
+4. **Zero-Copy Streaming Performance:** Hardy parses and spools bundles in a high-performance zero-copy pipeline without heap allocations. Requiring strict canonical extents ensures predictable execution without intermediate transformation buffers.
+5. **Prevention of Protocol Ossification:** As detailed in RFC 9413, implementations that silently tolerate malformed inputs encourage buggy implementations to proliferate and create accidental de-facto dialects that hinder interoperability.
+
+For specialized test environments where non-conforming third-party implementations must be tested, Hardy provides explicit opt-in relaxation flags (such as `--lax-rfc9171` in `bp ping` and `[rfc9171-validity]` in `hardy_config.toml`).
+
 ## Prerequisites
 
 The testbed runs using the project's Python virtual environment (`./.venv/`) with `scapy` and `cbor2`:

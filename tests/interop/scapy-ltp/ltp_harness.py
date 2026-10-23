@@ -20,7 +20,15 @@ def make_bpv7_bundle(
     dest_service: int = 7,
     payload: bytes = b"PING",
 ) -> bytes:
-    """Create an RFC 9171 BPv7 bundle containing a payload block."""
+    """Create an RFC 9171 BPv7 bundle containing a payload block.
+
+    Normative encoding requirements enforced by Hardy:
+    - RFC 9171 §4.1: Indefinite-length CBOR array (0x9F ... 0xFF).
+    - RFC 9171 §4.2.6: Synchronized creation timestamp (milliseconds since
+      DTN epoch 2000-01-01T00:00:00Z) to allow lifetime computation without
+      a Bundle Age block.
+    - Preserves BPSec compatibility and avoids non-canonical re-encoding (RFC 9413).
+    """
     import time
 
     dest_eid = [2, [dest_node, dest_service]]
