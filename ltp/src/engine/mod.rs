@@ -17,7 +17,7 @@ pub mod config;
 pub mod session;
 pub mod timer;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, PeerTiming};
 use session::{CheckpointRecord, RecvSession, ReportRecord, SendSession};
 use timer::{TimerKey, TimerKind, TimerTable};
 
@@ -95,6 +95,44 @@ fn next_nonzero_serial(cur: &mut u64) -> NonZeroU64 {
     NonZeroU64::new(*cur).expect("non zero")
 }
 
+fn peer_timeout_deadline_with(
+    timings: &BTreeMap<EngineId, PeerTiming>,
+    config: &EngineConfig,
+    peer: EngineId,
+    now: u64,
+) -> u64 {
+    let timeout = timings
+        .get(&peer)
+        .map(PeerTiming::timeout_duration_micros)
+        .unwrap_or_else(|| config.rtt_micros.saturating_add(config.ack_margin_micros));
+    now.saturating_add(timeout)
+}
+
+fn update_peer_rtt_sample_with(
+    timings: &mut BTreeMap<EngineId, PeerTiming>,
+    config: &EngineConfig,
+    peer: EngineId,
+    sample_rtt_micros: u64,
+) {
+    let current = timings.get(&peer).copied().unwrap_or(PeerTiming {
+        rtt_micros: config.rtt_micros,
+        ack_margin_micros: config.ack_margin_micros,
+    });
+    let updated_rtt = if current.rtt_micros == 0 {
+        sample_rtt_micros
+    } else {
+        (current
+            .rtt_micros
+            .saturating_mul(7)
+            .saturating_add(sample_rtt_micros))
+            / 8
+    };
+    timings.insert(
+        peer,
+        PeerTiming::new(updated_rtt, current.ack_margin_micros),
+    );
+}
+
 /// The sans-I/O LTP protocol engine.
 #[derive(Debug)]
 pub struct Engine {
@@ -109,6 +147,7 @@ pub struct Engine {
     cancelled_sessions_set: BTreeSet<SessionId>,
     outbound: VecDeque<(EngineId, Vec<u8>)>,
     notices: VecDeque<Notice>,
+    peer_timings: BTreeMap<EngineId, PeerTiming>,
 }
 
 impl Engine {
@@ -128,7 +167,42 @@ impl Engine {
             cancelled_sessions_set: BTreeSet::new(),
             outbound: VecDeque::new(),
             notices: VecDeque::new(),
+            peer_timings: BTreeMap::new(),
         }
+    }
+
+    /// Returns the timing parameters (RTT and ACK margin) for `peer`.
+    ///
+    /// If no peer-specific timing has been configured, returns the default
+    /// parameters from [`EngineConfig`].
+    #[must_use]
+    pub fn peer_timing(&self, peer: EngineId) -> PeerTiming {
+        self.peer_timings.get(&peer).copied().unwrap_or(PeerTiming {
+            rtt_micros: self.config.rtt_micros,
+            ack_margin_micros: self.config.ack_margin_micros,
+        })
+    }
+
+    /// Configures or dynamically updates the timing parameters for `peer` (e.g. from TVR / contact plan).
+    pub fn set_peer_timing(&mut self, peer: EngineId, rtt_micros: u64, ack_margin_micros: u64) {
+        self.peer_timings
+            .insert(peer, PeerTiming::new(rtt_micros, ack_margin_micros));
+    }
+
+    /// Computes the timer deadline for an operation directed to `peer` starting at `now`.
+    #[must_use]
+    pub fn peer_timeout_deadline(&self, peer: EngineId, now: u64) -> u64 {
+        peer_timeout_deadline_with(&self.peer_timings, &self.config, peer, now)
+    }
+
+    /// Updates the smoothed RTT for `peer` using an un-retransmitted RTT sample (RFC 5326 §6.7).
+    pub fn update_peer_rtt_sample(&mut self, peer: EngineId, sample_rtt_micros: u64) {
+        update_peer_rtt_sample_with(
+            &mut self.peer_timings,
+            &self.config,
+            peer,
+            sample_rtt_micros,
+        );
     }
 
     /// Returns the engine configuration.
@@ -230,6 +304,7 @@ impl Engine {
                     is_eorp: true,
                     is_eob,
                     retries: 0,
+                    transmitted_at: now,
                 };
 
                 (kind, Some(record))
@@ -253,9 +328,8 @@ impl Engine {
 
             if let Some(record) = cp_rec {
                 session.checkpoints.insert(record.serial.get(), record);
-                let deadline = now
-                    .saturating_add(self.config.rtt_micros)
-                    .saturating_add(self.config.ack_margin_micros);
+                let deadline =
+                    peer_timeout_deadline_with(&self.peer_timings, &self.config, peer, now);
                 self.timer_table.set(
                     TimerKey::checkpoint(session_id, session.last_cp_serial),
                     deadline,
@@ -525,9 +599,12 @@ impl Engine {
                                 body: SegmentBody::Report(rec.report.clone()),
                             };
                             self.outbound.push_back((from, wire_seg.encode_to_vec()));
-                            let deadline = now
-                                .saturating_add(self.config.rtt_micros)
-                                .saturating_add(self.config.ack_margin_micros);
+                            let deadline = peer_timeout_deadline_with(
+                                &self.peer_timings,
+                                &self.config,
+                                from,
+                                now,
+                            );
                             self.timer_table
                                 .set(TimerKey::report(session_id, rs_serial), deadline);
                         }
@@ -569,15 +646,15 @@ impl Engine {
                             report: report_seg,
                             retries: 0,
                             acked: false,
+                            transmitted_at: now,
                         };
                         session.reports.insert(report_serial, record);
                         session
                             .cp_serials_answered
                             .insert(cp_serial, alloc::vec![report_serial]);
 
-                        let deadline = now
-                            .saturating_add(self.config.rtt_micros)
-                            .saturating_add(self.config.ack_margin_micros);
+                        let deadline =
+                            peer_timeout_deadline_with(&self.peer_timings, &self.config, from, now);
                         self.timer_table
                             .set(TimerKey::report(session_id, report_serial), deadline);
                     } else {
@@ -641,12 +718,16 @@ impl Engine {
                                 report: report_seg,
                                 retries: 0,
                                 acked: false,
+                                transmitted_at: now,
                             };
                             session.reports.insert(rs_serial, record);
 
-                            let deadline = now
-                                .saturating_add(self.config.rtt_micros)
-                                .saturating_add(self.config.ack_margin_micros);
+                            let deadline = peer_timeout_deadline_with(
+                                &self.peer_timings,
+                                &self.config,
+                                from,
+                                now,
+                            );
                             self.timer_table
                                 .set(TimerKey::report(session_id, rs_serial), deadline);
                         }
@@ -710,9 +791,7 @@ impl Engine {
             };
             self.outbound.push_back((peer, cr.encode_to_vec()));
 
-            let deadline = now
-                .saturating_add(self.config.rtt_micros)
-                .saturating_add(self.config.ack_margin_micros);
+            let deadline = peer_timeout_deadline_with(&self.peer_timings, &self.config, peer, now);
             self.timer_table
                 .set(TimerKey::cancel(session_id, false), deadline);
 
@@ -763,7 +842,13 @@ impl Engine {
             );
         }
 
-        session.checkpoints.remove(&rs.checkpoint_serial);
+        if let Some(cp_rec) = session.checkpoints.remove(&rs.checkpoint_serial) {
+            // Karn's algorithm: only sample RTT on checkpoints never retransmitted
+            if cp_rec.retries == 0 && now >= cp_rec.transmitted_at {
+                let sample_rtt = now.saturating_sub(cp_rec.transmitted_at);
+                update_peer_rtt_sample_with(&mut self.peer_timings, &self.config, from, sample_rtt);
+            }
+        }
 
         if !session.report_serials_seen.insert(rs.report_serial.get()) {
             return; // Deduplicate
@@ -831,6 +916,7 @@ impl Engine {
                         is_eorp,
                         is_eob,
                         retries: 0,
+                        transmitted_at: now,
                     };
                     (kind, Some(record))
                 } else {
@@ -856,9 +942,12 @@ impl Engine {
 
                     if let Some(record) = cp_rec {
                         session.checkpoints.insert(record.serial.get(), record);
-                        let deadline = now
-                            .saturating_add(self.config.rtt_micros)
-                            .saturating_add(self.config.ack_margin_micros);
+                        let deadline = peer_timeout_deadline_with(
+                            &self.peer_timings,
+                            &self.config,
+                            session.peer,
+                            now,
+                        );
                         self.timer_table.set(
                             TimerKey::checkpoint(session_id, session.last_cp_serial),
                             deadline,
@@ -897,6 +986,7 @@ impl Engine {
                 is_eorp: true,
                 is_eob,
                 retries: 0,
+                transmitted_at: now,
             };
             let start_idx = cp_offset as usize;
             let end_idx = (cp_offset + cp_len) as usize;
@@ -914,9 +1004,8 @@ impl Engine {
                 };
                 self.outbound.push_back((from, seg.encode_to_vec()));
                 session.checkpoints.insert(record.serial.get(), record);
-                let deadline = now
-                    .saturating_add(self.config.rtt_micros)
-                    .saturating_add(self.config.ack_margin_micros);
+                let deadline =
+                    peer_timeout_deadline_with(&self.peer_timings, &self.config, session.peer, now);
                 self.timer_table.set(
                     TimerKey::checkpoint(session_id, session.last_cp_serial),
                     deadline,
@@ -953,6 +1042,16 @@ impl Engine {
             }
 
             if let Some(rec) = session.reports.get_mut(&report_serial) {
+                if !rec.acked && rec.retries == 0 && now >= rec.transmitted_at {
+                    let sample_rtt = now.saturating_sub(rec.transmitted_at);
+                    let peer = session.peer;
+                    update_peer_rtt_sample_with(
+                        &mut self.peer_timings,
+                        &self.config,
+                        peer,
+                        sample_rtt,
+                    );
+                }
                 rec.acked = true;
                 for claim in &rec.report.claims {
                     let start = rec.report.lower_bound.saturating_add(claim.offset);
@@ -1163,9 +1262,8 @@ impl Engine {
 
             self.outbound.push_back((session.peer, seg.encode_to_vec()));
 
-            let deadline = now
-                .saturating_add(self.config.rtt_micros)
-                .saturating_add(self.config.ack_margin_micros);
+            let deadline =
+                peer_timeout_deadline_with(&self.peer_timings, &self.config, session.peer, now);
             self.timer_table
                 .set(TimerKey::checkpoint(session_id, serial), deadline);
         } else {
@@ -1184,9 +1282,7 @@ impl Engine {
             };
             self.outbound.push_back((peer, cs.encode_to_vec()));
 
-            let deadline = now
-                .saturating_add(self.config.rtt_micros)
-                .saturating_add(self.config.ack_margin_micros);
+            let deadline = peer_timeout_deadline_with(&self.peer_timings, &self.config, peer, now);
             self.timer_table
                 .set(TimerKey::cancel(session_id, true), deadline);
 
@@ -1223,9 +1319,8 @@ impl Engine {
 
             self.outbound.push_back((session.peer, seg.encode_to_vec()));
 
-            let deadline = now
-                .saturating_add(self.config.rtt_micros)
-                .saturating_add(self.config.ack_margin_micros);
+            let deadline =
+                peer_timeout_deadline_with(&self.peer_timings, &self.config, session.peer, now);
             self.timer_table
                 .set(TimerKey::report(session_id, serial), deadline);
         } else {
@@ -1244,9 +1339,7 @@ impl Engine {
             };
             self.outbound.push_back((peer, cr.encode_to_vec()));
 
-            let deadline = now
-                .saturating_add(self.config.rtt_micros)
-                .saturating_add(self.config.ack_margin_micros);
+            let deadline = peer_timeout_deadline_with(&self.peer_timings, &self.config, peer, now);
             self.timer_table
                 .set(TimerKey::cancel(session_id, false), deadline);
 
@@ -1272,9 +1365,12 @@ impl Engine {
                         },
                     };
                     self.outbound.push_back((session.peer, cs.encode_to_vec()));
-                    let deadline = now
-                        .saturating_add(self.config.rtt_micros)
-                        .saturating_add(self.config.ack_margin_micros);
+                    let deadline = peer_timeout_deadline_with(
+                        &self.peer_timings,
+                        &self.config,
+                        session.peer,
+                        now,
+                    );
                     self.timer_table
                         .set(TimerKey::cancel(session_id, true), deadline);
                 } else {
@@ -1295,9 +1391,8 @@ impl Engine {
                     },
                 };
                 self.outbound.push_back((session.peer, cr.encode_to_vec()));
-                let deadline = now
-                    .saturating_add(self.config.rtt_micros)
-                    .saturating_add(self.config.ack_margin_micros);
+                let deadline =
+                    peer_timeout_deadline_with(&self.peer_timings, &self.config, session.peer, now);
                 self.timer_table
                     .set(TimerKey::cancel(session_id, false), deadline);
             } else {

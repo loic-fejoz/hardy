@@ -2,15 +2,19 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
+use hardy_async::TaskPool;
 use hardy_bpa::async_trait;
-use hardy_bpa::cla::{Cla, ClaAddress, ForwardBundleResult, Result as ClaResult, Segment, Sink};
+use hardy_bpa::cla::{
+    Cla, ClaAddress, ClaInit, ForwardBundleResult, Result as ClaResult, Segment, Sink,
+};
 use hardy_bpa::stream::{Receiver, buffer_stream};
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
@@ -23,9 +27,30 @@ use crate::error::{Error, Result};
 /// Inner state of the LTP CLA.
 struct ClaInner {
     sink: Arc<dyn Sink>,
+    tasks: Arc<TaskPool>,
     cmd_tx: mpsc::Sender<DriverCommand>,
     local_addr: SocketAddr,
+    max_bundle_size: Option<NonZeroU64>,
     _driver_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Converts an LTP [`EngineId`] into its canonical Hardy [`ClaAddress`].
+#[must_use]
+pub fn engine_id_to_cla_address(engine_id: EngineId) -> ClaAddress {
+    ClaAddress::Private(Bytes::copy_from_slice(&engine_id.0.to_be_bytes()))
+}
+
+/// Attempts to parse an LTP [`EngineId`] from a [`ClaAddress`].
+#[must_use]
+pub fn cla_address_to_engine_id(cla_addr: &ClaAddress) -> Option<EngineId> {
+    match cla_addr {
+        ClaAddress::Private(b) if b.len() == 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(b);
+            Some(EngineId(u64::from_be_bytes(arr)))
+        }
+        _ => None,
+    }
 }
 
 /// The Licklider Transmission Protocol Convergence Layer Adapter.
@@ -33,16 +58,24 @@ pub struct LtpCla {
     config: Config,
     inner: Arc<RwLock<Option<ClaInner>>>,
     peer_mappings: Arc<RwLock<HashMap<ClaAddress, EngineId>>>,
+    peer_timings: Arc<RwLock<HashMap<EngineId, (Duration, Duration)>>>,
 }
 
 impl LtpCla {
     /// Creates a new LTP CLA instance with the given configuration.
     #[must_use]
     pub fn new(config: Config) -> Self {
+        let mut peer_timings = HashMap::new();
+        for peer in &config.peers {
+            if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                peer_timings.insert(peer.engine_id, (rtt, ack_margin));
+            }
+        }
         Self {
             config,
             inner: Arc::new(RwLock::new(None)),
             peer_mappings: Arc::new(RwLock::new(HashMap::new())),
+            peer_timings: Arc::new(RwLock::new(peer_timings)),
         }
     }
 
@@ -53,6 +86,25 @@ impl LtpCla {
         Ok(inner.local_addr)
     }
 
+    /// Returns the currently configured timing (RTT, ACK margin) for a peer, if set.
+    pub async fn peer_timing(&self, engine_id: EngineId) -> Option<(Duration, Duration)> {
+        self.peer_timings.read().await.get(&engine_id).copied()
+    }
+
+    /// Returns the initialisation parameters for registering this CLA with the BPA.
+    ///
+    /// Declares 2 lanes:
+    /// - Lane 0: Red data (reliable, fully acknowledged)
+    /// - Lane 1: Green data (unreliable datagram, no acknowledgments)
+    #[must_use]
+    pub fn cla_init(&self) -> ClaInit {
+        ClaInit {
+            address_type: None,
+            lane_count: NonZeroU32::new(2),
+            max_bundle_size: None,
+        }
+    }
+
     /// Registers a peer address to Engine ID mapping and notifies the driver.
     pub async fn register_peer(
         &self,
@@ -60,11 +112,12 @@ impl LtpCla {
         addr: SocketAddr,
         node_id: Option<NodeId>,
     ) -> Result<()> {
-        let cla_addr = ClaAddress::Tcp(addr);
-        self.peer_mappings
-            .write()
-            .await
-            .insert(cla_addr.clone(), engine_id);
+        let cla_addr = engine_id_to_cla_address(engine_id);
+        {
+            let mut mappings = self.peer_mappings.write().await;
+            mappings.insert(cla_addr.clone(), engine_id);
+            mappings.insert(ClaAddress::Tcp(addr), engine_id);
+        }
 
         let inner_guard = self.inner.read().await;
         if let Some(inner) = inner_guard.as_ref() {
@@ -88,13 +141,59 @@ impl LtpCla {
         Ok(())
     }
 
+    /// Unregisters a peer and removes it from the BPA routing table.
+    pub async fn unregister_peer(&self, engine_id: EngineId) -> Result<()> {
+        let cla_addr = engine_id_to_cla_address(engine_id);
+        self.peer_mappings.write().await.remove(&cla_addr);
+        self.peer_timings.write().await.remove(&engine_id);
+
+        let inner_guard = self.inner.read().await;
+        if let Some(inner) = inner_guard.as_ref() {
+            let _ = inner.sink.remove_peer(&cla_addr).await;
+            inner
+                .cmd_tx
+                .send(DriverCommand::UnregisterPeer { engine_id })
+                .await
+                .map_err(|_| Error::DriverClosed)?;
+        }
+
+        Ok(())
+    }
+
+    /// Configures or dynamically updates the round-trip time and ACK margin for a remote peer engine (e.g. from TVR).
+    pub async fn set_peer_timing(
+        &self,
+        engine_id: EngineId,
+        rtt: Duration,
+        ack_margin: Duration,
+    ) -> Result<()> {
+        self.peer_timings
+            .write()
+            .await
+            .insert(engine_id, (rtt, ack_margin));
+        let inner_guard = self.inner.read().await;
+        if let Some(inner) = inner_guard.as_ref() {
+            inner
+                .cmd_tx
+                .send(DriverCommand::SetPeerTiming {
+                    engine_id,
+                    rtt,
+                    ack_margin,
+                })
+                .await
+                .map_err(|_| Error::DriverClosed)?;
+        }
+        Ok(())
+    }
+
     /// Unregisters this CLA from the BPA and shuts down the background driver.
     pub async fn unregister(&self) {
         let mut inner_guard = self.inner.write().await;
         if let Some(inner) = inner_guard.take() {
             inner.sink.unregister().await;
-            drop(inner.cmd_tx);
+            let _ = inner.cmd_tx.send(DriverCommand::Shutdown).await;
             let _ = inner._driver_handle.await;
+            inner.tasks.shutdown().await;
         }
     }
 }
@@ -105,7 +204,7 @@ impl Cla for LtpCla {
         &self,
         sink: Box<dyn Sink>,
         _node_ids: &[NodeId],
-        _max_bundle_size: Option<NonZeroU64>,
+        max_bundle_size: Option<NonZeroU64>,
     ) {
         info!(
             "registering LTP CLA (Engine ID {}) with BPA",
@@ -115,7 +214,14 @@ impl Cla for LtpCla {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (addr_tx, addr_rx) = oneshot::channel();
 
-        let driver_handle = Driver::spawn(self.config.clone(), sink.clone(), cmd_rx, addr_tx);
+        let tasks = Arc::new(TaskPool::new());
+        let driver_handle = Driver::spawn(
+            self.config.clone(),
+            sink.clone(),
+            cmd_rx,
+            addr_tx,
+            tasks.clone(),
+        );
         let local_addr = match addr_rx.await {
             Ok(Ok(addr)) => addr,
             Ok(Err(e)) => {
@@ -135,15 +241,14 @@ impl Cla for LtpCla {
         };
 
         for peer in &self.config.peers {
-            let cla_addr = if let Some(addr) = peer.address {
-                ClaAddress::Tcp(addr)
-            } else {
-                ClaAddress::Private(Bytes::copy_from_slice(&peer.engine_id.0.to_be_bytes()))
-            };
-            self.peer_mappings
-                .write()
-                .await
-                .insert(cla_addr.clone(), peer.engine_id);
+            let cla_addr = engine_id_to_cla_address(peer.engine_id);
+            {
+                let mut mappings = self.peer_mappings.write().await;
+                mappings.insert(cla_addr.clone(), peer.engine_id);
+                if let Some(addr) = peer.address {
+                    mappings.insert(ClaAddress::Tcp(addr), peer.engine_id);
+                }
+            }
             if let Some(ref node_id) = peer.node_id {
                 let _ = sink.add_peer(cla_addr, std::slice::from_ref(node_id)).await;
             }
@@ -153,6 +258,15 @@ impl Cla for LtpCla {
                         engine_id: peer.engine_id,
                         addr,
                         node_id: peer.node_id.clone(),
+                    })
+                    .await;
+            }
+            if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                let _ = cmd_tx
+                    .send(DriverCommand::SetPeerTiming {
+                        engine_id: peer.engine_id,
+                        rtt,
+                        ack_margin,
                     })
                     .await;
             }
@@ -172,11 +286,24 @@ impl Cla for LtpCla {
             }
         }
 
+        let timings = self.peer_timings.read().await;
+        for (&engine_id, &(rtt, ack_margin)) in timings.iter() {
+            let _ = cmd_tx
+                .send(DriverCommand::SetPeerTiming {
+                    engine_id,
+                    rtt,
+                    ack_margin,
+                })
+                .await;
+        }
+
         let mut inner_guard = self.inner.write().await;
         *inner_guard = Some(ClaInner {
             sink,
+            tasks,
             cmd_tx,
             local_addr,
+            max_bundle_size,
             _driver_handle: driver_handle,
         });
     }
@@ -187,49 +314,57 @@ impl Cla for LtpCla {
         if let Some(inner) = inner_guard.take() {
             let _ = inner.cmd_tx.send(DriverCommand::Shutdown).await;
             let _ = inner._driver_handle.await;
+            inner.tasks.shutdown().await;
         }
     }
 
     async fn forward(
         &self,
-        _lane: Option<u32>,
+        lane: Option<u32>,
         cla_addr: &ClaAddress,
         bundle_id: &Id,
         total_len: u64,
         stream: &mut dyn Receiver<Segment>,
     ) -> ClaResult<ForwardBundleResult> {
-        let cmd_tx = {
+        let (cmd_tx, max_bundle_size) = {
             let inner_guard = self.inner.read().await;
             let inner = inner_guard
                 .as_ref()
                 .ok_or(hardy_bpa::cla::Error::Disconnected)?;
-            inner.cmd_tx.clone()
+            (inner.cmd_tx.clone(), inner.max_bundle_size)
         };
+
+        if let Some(cap) = max_bundle_size
+            && total_len > cap.get()
+        {
+            return Err(hardy_bpa::cla::Error::PayloadTooLarge {
+                size: total_len,
+                max: cap.get(),
+            });
+        }
 
         // Resolve destination EngineId
         let destination_engine = {
             let mappings = self.peer_mappings.read().await;
             if let Some(&id) = mappings.get(cla_addr) {
                 id
+            } else if let Some(id) = cla_address_to_engine_id(cla_addr) {
+                id
             } else {
-                match cla_addr {
-                    ClaAddress::Tcp(addr) => EngineId(addr.port() as u64),
-                    ClaAddress::Private(b) if b.len() == 8 => {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(b);
-                        EngineId(u64::from_be_bytes(arr))
-                    }
-                    _ => {
-                        return Err(hardy_bpa::cla::Error::from(
-                            crate::error::Error::UnknownPeer(cla_addr.clone()),
-                        ));
-                    }
-                }
+                return Ok(ForwardBundleResult::NoNeighbour);
             }
         };
 
+        // Reliability class mapping via lanes:
+        // - Lane 1: Green data (unreliable datagram, red_len = 0)
+        // - Lane 0 / None: Red data (reliable transfer, red_len = total_len)
+        let red_len = match lane {
+            Some(1) => 0,
+            _ => total_len,
+        };
+
         debug!(
-            "buffering bundle {bundle_id} ({total_len} bytes) for LTP transmission to {destination_engine:?}"
+            "buffering bundle {bundle_id} ({total_len} bytes, red_len {red_len}) for LTP transmission to {destination_engine:?}"
         );
         let bundle_bytes = buffer_stream(stream, total_len).await?;
 
@@ -239,7 +374,7 @@ impl Cla for LtpCla {
                 bundle_id: bundle_id.clone(),
                 destination_engine,
                 data: bundle_bytes,
-                red_len: total_len, // Entire bundle is sent reliably as Red data
+                red_len,
                 reply_tx,
             })
             .await

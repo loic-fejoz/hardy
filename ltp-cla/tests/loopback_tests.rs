@@ -3,7 +3,8 @@
 //! Tests UDP datagram transport (RFC 7122) and KISS over TCP transport
 //! using local loopback and mock BPA sinks.
 
-use std::num::NonZeroU64;
+use std::net::SocketAddr;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 use std::vec::Vec;
 
@@ -25,7 +26,10 @@ use hardy_ltp::segment::{
     Checkpoint, DataSegKind, DataSegment, Segment as LtpSegment, SegmentBody,
 };
 use hardy_ltp::types::{CancelReason, SessionId};
-use hardy_ltp_cla::{Config, EngineId, LtpCla, PeerEntry, TransportMode};
+use hardy_ltp_cla::{
+    Config, EngineId, LtpCla, PeerEntry, TransportMode, cla_address_to_engine_id,
+    engine_id_to_cla_address,
+};
 
 /// Mock BPA sink capturing dispatches and transfer outcomes.
 struct MockSink {
@@ -112,6 +116,7 @@ async fn test_udp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -133,6 +138,7 @@ async fn test_udp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -184,7 +190,10 @@ async fn test_udp_cla_nominal_transfer() {
             .expect("must receive dispatched bundle");
 
     assert_eq!(received_peer_node.as_ref(), Some(&node_id_1));
-    assert_eq!(received_peer_addr, Some(ClaAddress::Tcp(addr_1)));
+    assert_eq!(
+        received_peer_addr,
+        Some(engine_id_to_cla_address(EngineId(1)))
+    );
     assert_eq!(Sha256::digest(&received_bytes), expected_hash);
 
     // Wait for Node 1 to receive confirmation outcome
@@ -273,6 +282,7 @@ async fn test_kiss_tcp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: Some(node_id_2.clone()),
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -291,6 +301,7 @@ async fn test_kiss_tcp_cla_nominal_transfer() {
             engine_id: EngineId(1),
             address: Some(server_addr),
             node_id: Some(node_id_1.clone()),
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -388,6 +399,7 @@ async fn test_kiss_tcp_reconnection_and_backoff() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
 
@@ -478,11 +490,13 @@ async fn test_s17_multi_station_kiss_tcp_peer_resolution() {
                 engine_id: EngineId(2),
                 address: None, // Defaults to server_addr
                 node_id: Some("dtn://station2/".parse().unwrap()),
+                ..Default::default()
             },
             PeerEntry {
                 engine_id: EngineId(3),
                 address: None, // Defaults to server_addr
                 node_id: Some("dtn://station3/".parse().unwrap()),
+                ..Default::default()
             },
         ],
     };
@@ -574,6 +588,7 @@ async fn test_s18_driver_shutdown_notifies_pending_transfers() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
 
@@ -636,6 +651,7 @@ async fn test_s37_udp_keepalive_packet_discarded() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -739,6 +755,7 @@ async fn test_s39_udp_peer_port_migration_dynamic_rebinding() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()), // Dummy address updated dynamically
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -856,6 +873,7 @@ async fn test_s40_udp_addr_to_engine_table_eviction() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -975,6 +993,7 @@ async fn test_s41_kiss_tcp_extreme_stream_fragmentation() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1096,6 +1115,7 @@ async fn test_s42_kiss_tcp_accumulator_overflow_and_recovery() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1213,6 +1233,7 @@ async fn test_s43_kiss_tcp_non_data_commands_ignored() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1342,6 +1363,7 @@ async fn test_s44_transfer_outcome_failed_on_remote_cancellation_or_timeout() {
             engine_id: EngineId(2),
             address: Some(mock_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1423,6 +1445,7 @@ async fn test_s45_client_service_filtered_before_dispatch() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1508,6 +1531,7 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -1529,6 +1553,7 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
             engine_id: EngineId(1),
             address: Some(addr_1),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -1638,6 +1663,568 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
         received_hashes_at_1.push(Sha256::digest(&bytes));
     }
     assert_eq!(received_hashes_at_1, expected_hashes_at_1);
+
+    cla_1.unregister().await;
+    cla_2.unregister().await;
+}
+
+#[tokio::test]
+async fn test_canonical_ltp_address_resolution() {
+    let eid = EngineId(0x1234_5678_9ABC_DEF0);
+    let cla_addr = engine_id_to_cla_address(eid);
+    assert_eq!(cla_address_to_engine_id(&cla_addr), Some(eid));
+
+    // Unknown address formats fail resolution
+    let dummy_addr = ClaAddress::Tcp("127.0.0.1:9600".parse().unwrap());
+    assert_eq!(cla_address_to_engine_id(&dummy_addr), None);
+    let short_private = ClaAddress::Private(Bytes::from_static(&[1, 2, 3]));
+    assert_eq!(cla_address_to_engine_id(&short_private), None);
+}
+
+#[tokio::test]
+async fn test_ltp_cla_init_lane_count() {
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    let init = cla.cla_init();
+    assert_eq!(init.lane_count, NonZeroU32::new(2));
+    assert_eq!(init.address_type, None);
+}
+
+#[tokio::test]
+async fn test_udp_cla_green_data_transfer() {
+    let (disp_tx_1, mut _disp_rx_1) = mpsc::channel(16);
+    let (outc_tx_1, mut outc_rx_1) = mpsc::channel(16);
+    let sink_1 = Box::new(MockSink {
+        dispatches: disp_tx_1,
+        outcomes: outc_tx_1,
+    });
+
+    let (disp_tx_2, mut disp_rx_2) = mpsc::channel(16);
+    let (outc_tx_2, mut _outc_rx_2) = mpsc::channel(16);
+    let sink_2 = Box::new(MockSink {
+        dispatches: disp_tx_2,
+        outcomes: outc_tx_2,
+    });
+
+    let cfg_1 = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_1 = LtpCla::new(cfg_1);
+    cla_1.on_register(sink_1, &[], None).await;
+    let addr_1 = cla_1.local_addr().await.unwrap();
+
+    let cfg_2 = Config {
+        engine_id: EngineId(2),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_2 = LtpCla::new(cfg_2);
+    cla_2.on_register(sink_2, &[], None).await;
+    let addr_2 = cla_2.local_addr().await.unwrap();
+
+    let node_id_1: NodeId = "dtn://node-1/".parse().unwrap();
+    let node_id_2: NodeId = "dtn://node-2/".parse().unwrap();
+
+    cla_1
+        .register_peer(EngineId(2), addr_2, Some(node_id_2.clone()))
+        .await
+        .unwrap();
+    cla_2
+        .register_peer(EngineId(1), addr_1, Some(node_id_1.clone()))
+        .await
+        .unwrap();
+
+    // 1. Single-segment green bundle (lane = Some(1))
+    let single_payload = vec![0x42u8; 128];
+    let single_hash = Sha256::digest(&single_payload);
+    let bundle_id_single = create_test_bundle_id("green-single");
+    let mut stream_single = Bytes::copy_from_slice(&single_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(2)),
+            &bundle_id_single,
+            single_payload.len() as u64,
+            &mut stream_single,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Verify dispatch at Node 2
+    let (_, _, received_single) = tokio::time::timeout(Duration::from_secs(5), disp_rx_2.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(Sha256::digest(&received_single), single_hash);
+
+    // Verify immediate completion outcome at Node 1
+    let (outcome_id, outcome) = tokio::time::timeout(Duration::from_secs(5), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(outcome_id, bundle_id_single);
+    assert_eq!(outcome, TransferOutcome::Completed);
+
+    // 2. Multi-segment green bundle (lane = Some(1), 5 KiB over 1024 MTU)
+    let multi_payload = vec![0x77u8; 5120];
+    let multi_hash = Sha256::digest(&multi_payload);
+    let bundle_id_multi = create_test_bundle_id("green-multi");
+    let mut stream_multi = Bytes::copy_from_slice(&multi_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(2)),
+            &bundle_id_multi,
+            multi_payload.len() as u64,
+            &mut stream_multi,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    let (_, _, received_multi) = tokio::time::timeout(Duration::from_secs(5), disp_rx_2.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(Sha256::digest(&received_multi), multi_hash);
+
+    let (outcome_id, outcome) = tokio::time::timeout(Duration::from_secs(5), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(outcome_id, bundle_id_multi);
+    assert_eq!(outcome, TransferOutcome::Completed);
+
+    // 3. Verify that Green data on Lane 1 completes immediately without waiting for any ACKs
+    let dummy_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dummy_addr = dummy_rx.local_addr().unwrap();
+    cla_1
+        .register_peer(EngineId(99), dummy_addr, None)
+        .await
+        .unwrap();
+
+    let unacked_payload = vec![0x99u8; 64];
+    let unacked_id = create_test_bundle_id("unacked-green");
+    let mut unacked_stream = Bytes::copy_from_slice(&unacked_payload);
+
+    let res = cla_1
+        .forward(
+            Some(1), // Lane 1: Green data
+            &engine_id_to_cla_address(EngineId(99)),
+            &unacked_id,
+            unacked_payload.len() as u64,
+            &mut unacked_stream,
+        )
+        .await
+        .expect("forward succeeds");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Must complete immediately without any remote acknowledgments
+    let (out_id, out) = tokio::time::timeout(Duration::from_millis(500), outc_rx_1.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .unwrap();
+    assert_eq!(out_id, unacked_id);
+    assert_eq!(out, TransferOutcome::Completed);
+
+    cla_1.unregister().await;
+    cla_2.unregister().await;
+}
+
+#[tokio::test]
+async fn test_max_bundle_size_enforcement() {
+    let (disp_tx, _) = mpsc::channel(16);
+    let (outc_tx, _) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.register_peer(EngineId(2), "127.0.0.1:9999".parse().unwrap(), None)
+        .await
+        .unwrap();
+    // Register with a cap of 1000 bytes
+    cla.on_register(sink, &[], NonZeroU64::new(1000)).await;
+
+    // 1. Bundle of 1500 bytes exceeds the cap -> rejected
+    let big_payload = vec![0xEEu8; 1500];
+    let big_bundle = create_test_bundle_id("too-big");
+    let mut big_stream = Bytes::copy_from_slice(&big_payload);
+
+    let err = match cla
+        .forward(
+            None,
+            &engine_id_to_cla_address(EngineId(2)),
+            &big_bundle,
+            big_payload.len() as u64,
+            &mut big_stream,
+        )
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("expected forward to fail with PayloadTooLarge"),
+    };
+
+    match err {
+        hardy_bpa::cla::Error::PayloadTooLarge { size, max } => {
+            assert_eq!(size, 1500);
+            assert_eq!(max, 1000);
+        }
+        other => panic!("expected PayloadTooLarge, got: {other:?}"),
+    }
+
+    // 2. Bundle of exactly 1000 bytes (boundary condition: total_len == cap) -> accepted
+    let exact_payload = vec![0xDDu8; 1000];
+    let exact_bundle = create_test_bundle_id("exact-cap");
+    let mut exact_stream = Bytes::copy_from_slice(&exact_payload);
+
+    let res = cla
+        .forward(
+            Some(1),
+            &engine_id_to_cla_address(EngineId(2)),
+            &exact_bundle,
+            exact_payload.len() as u64,
+            &mut exact_stream,
+        )
+        .await
+        .expect("exact cap bundle must be accepted");
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    cla.unregister().await;
+}
+
+struct PeerTrackingSink {
+    peers_added: mpsc::Sender<(ClaAddress, Vec<NodeId>)>,
+    peers_removed: Option<mpsc::Sender<ClaAddress>>,
+}
+
+#[async_trait]
+impl Sink for PeerTrackingSink {
+    async fn unregister(&self) {}
+    async fn dispatch(
+        &self,
+        _: Option<&NodeId>,
+        _: Option<&ClaAddress>,
+        _: &mut dyn Receiver<Segment>,
+    ) -> ClaResult<Acceptance> {
+        Ok(Acceptance::Accepted)
+    }
+    async fn add_peer(&self, addr: ClaAddress, nodes: &[NodeId]) -> ClaResult<bool> {
+        let _ = self.peers_added.send((addr, nodes.to_vec())).await;
+        Ok(true)
+    }
+    async fn remove_peer(&self, addr: &ClaAddress) -> ClaResult<bool> {
+        if let Some(ref tx) = self.peers_removed {
+            let _ = tx.send(addr.clone()).await;
+        }
+        Ok(true)
+    }
+    async fn transfer_outcome(&self, _: &Id, _: TransferOutcome) -> ClaResult<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_dynamic_peer_discovery_registers_with_sink() {
+    let (peer_tx, mut peer_rx) = mpsc::channel(16);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: peer_tx,
+        peers_removed: None,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(), // No pre-configured peers
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+    let local_addr = cla.local_addr().await.unwrap();
+
+    // Unknown station (Engine 77) sends an LTP green segment to Node 1 via raw UDP socket
+    let remote_engine = EngineId(77);
+    let ltp_seg = LtpSegment {
+        session: SessionId {
+            originator: remote_engine,
+            number: 1,
+        },
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: SegmentBody::Data(DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: DataSegKind::GreenEob,
+            data: &[0xAA; 32],
+        }),
+    };
+    let raw_bytes = ltp_seg.encode_to_vec();
+
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client_sock.send_to(&raw_bytes, local_addr).await.unwrap();
+
+    // Node 1 driver must dynamically discover Engine 77 and register it via sink.add_peer
+    let (discovered_addr, nodes) = tokio::time::timeout(Duration::from_secs(5), peer_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must discover and add peer");
+
+    assert_eq!(discovered_addr, engine_id_to_cla_address(remote_engine));
+    assert!(nodes.is_empty());
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_forward_to_unreachable_neighbor_returns_no_neighbour() {
+    let (disp_tx, _) = mpsc::channel(16);
+    let (outc_tx, _) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(),
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    // 1. Peer address that cannot be parsed as an EngineId
+    let bundle_id = create_test_bundle_id("no-neighbour");
+    let payload = vec![0x11u8; 64];
+    let mut stream = Bytes::copy_from_slice(&payload);
+    let unparseable_addr = ClaAddress::Tcp("127.0.0.1:9".parse().unwrap());
+
+    let res1 = cla
+        .forward(
+            None,
+            &unparseable_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res1, ForwardBundleResult::NoNeighbour));
+
+    // 2. Peer with a valid EngineId format, but no known network address endpoint
+    let mut stream2 = Bytes::copy_from_slice(&payload);
+    let disconnected_addr = engine_id_to_cla_address(EngineId(888));
+
+    let res2 = cla
+        .forward(
+            None,
+            &disconnected_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res2, ForwardBundleResult::NoNeighbour));
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_unregister_peer_lifecycle() {
+    let (peer_add_tx, _) = mpsc::channel(16);
+    let (peer_rem_tx, mut peer_rem_rx) = mpsc::channel(16);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: peer_add_tx,
+        peers_removed: Some(peer_rem_tx),
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    let target_engine = EngineId(42);
+    let target_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    cla.register_peer(target_engine, target_addr, None)
+        .await
+        .unwrap();
+
+    let target_cla_addr = engine_id_to_cla_address(target_engine);
+
+    // Forward succeeds while neighbor is registered
+    let payload = vec![0x22u8; 64];
+    let bundle_id = create_test_bundle_id("contact-open");
+    let mut stream = Bytes::copy_from_slice(&payload);
+    let res = cla
+        .forward(
+            Some(1),
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Simulate contact closing: unregister peer
+    cla.unregister_peer(target_engine).await.unwrap();
+
+    // Verify sink.remove_peer was notified
+    let removed = tokio::time::timeout(Duration::from_secs(5), peer_rem_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must receive removed peer notification");
+    assert_eq!(removed, target_cla_addr);
+
+    // Forward now returns NoNeighbour
+    let mut stream2 = Bytes::copy_from_slice(&payload);
+    let res2 = cla
+        .forward(
+            Some(1),
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res2, ForwardBundleResult::NoNeighbour));
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_dynamic_peer_timing_geo_and_cislunar() {
+    let (disp_1_tx, _) = mpsc::channel(16);
+    let (outc_1_tx, _) = mpsc::channel(16);
+    let sink_1 = Box::new(MockSink {
+        dispatches: disp_1_tx,
+        outcomes: outc_1_tx,
+    });
+
+    let (disp_2_tx, mut disp_2_rx) = mpsc::channel(16);
+    let (outc_2_tx, _) = mpsc::channel(16);
+    let sink_2 = Box::new(MockSink {
+        dispatches: disp_2_tx,
+        outcomes: outc_2_tx,
+    });
+
+    // Node 1 configured with peer 2 having initial GEO timing (RTT = 500ms, ack_margin = 200ms)
+    let cfg_1 = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        peers: vec![PeerEntry {
+            engine_id: EngineId(2),
+            address: Some("127.0.0.1:9".parse().unwrap()),
+            node_id: None,
+            rtt: Some(Duration::from_millis(500)),
+            ack_margin: Some(Duration::from_millis(200)),
+        }],
+        ..Default::default()
+    };
+    let cla_1 = LtpCla::new(cfg_1);
+    assert_eq!(
+        cla_1.peer_timing(EngineId(2)).await,
+        Some((Duration::from_millis(500), Duration::from_millis(200)))
+    );
+    assert_eq!(cla_1.peer_timing(EngineId(999)).await, None);
+    cla_1.on_register(sink_1, &[], None).await;
+
+    // Node 2 listening
+    let cfg_2 = Config {
+        engine_id: EngineId(2),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_2 = LtpCla::new(cfg_2);
+    cla_2.on_register(sink_2, &[], None).await;
+    let addr_2 = cla_2.local_addr().await.unwrap();
+
+    // Dynamically update peer 2's socket address and re-tune to Cislunar timing (RTT = 3.0s, ack_margin = 1.0s)
+    cla_1
+        .register_peer(EngineId(2), addr_2, None)
+        .await
+        .unwrap();
+    cla_1
+        .set_peer_timing(EngineId(2), Duration::from_secs(3), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        cla_1.peer_timing(EngineId(2)).await,
+        Some((Duration::from_secs(3), Duration::from_secs(1)))
+    );
+
+    let target_cla_addr = engine_id_to_cla_address(EngineId(2));
+    let bundle_id = create_test_bundle_id("cislunar-bundle");
+    let payload = vec![0x33u8; 128];
+    let mut stream = Bytes::copy_from_slice(&payload);
+
+    let res = cla_1
+        .forward(
+            None,
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Receiver should receive the complete bundle
+    let (_node, _cla_addr, received_payload) =
+        tokio::time::timeout(Duration::from_secs(5), disp_2_rx.recv())
+            .await
+            .expect("the timeout only bounds a regression")
+            .expect("must receive bundle");
+
+    assert_eq!(received_payload, payload);
+
+    // Unregister peer clears peer timing
+    cla_1.unregister_peer(EngineId(2)).await.unwrap();
+    assert_eq!(cla_1.peer_timing(EngineId(2)).await, None);
 
     cla_1.unregister().await;
     cla_2.unregister().await;

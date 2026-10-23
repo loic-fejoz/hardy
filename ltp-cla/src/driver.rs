@@ -11,7 +11,8 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
-use hardy_bpa::cla::{Acceptance, ClaAddress, ForwardBundleResult, Sink, TransferOutcome};
+use hardy_async::TaskPool;
+use hardy_bpa::cla::{Acceptance, ForwardBundleResult, Sink, TransferOutcome};
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
 use hardy_ltp::engine::{Engine, EngineConfig, Notice};
@@ -19,6 +20,7 @@ use hardy_ltp::kiss::{Command, decode_frame, encode_frame};
 use hardy_ltp::segment::Segment;
 use hardy_ltp::types::{EngineId, SessionId};
 
+use crate::cla::engine_id_to_cla_address;
 use crate::config::{Config, TransportMode};
 use crate::error::{Error, Result};
 
@@ -38,8 +40,25 @@ pub enum DriverCommand {
         addr: SocketAddr,
         node_id: Option<NodeId>,
     },
+    /// Unregister a remote peer and remove its routing associations.
+    UnregisterPeer { engine_id: EngineId },
+    /// Configure or dynamically update the RTT and ACK margin for a remote peer engine.
+    SetPeerTiming {
+        engine_id: EngineId,
+        rtt: Duration,
+        ack_margin: Duration,
+    },
     /// Gracefully shutdown the driver task.
     Shutdown,
+}
+
+#[derive(Debug)]
+struct GreenReassembly {
+    _source: EngineId,
+    data: Vec<u8>,
+    received_bytes: usize,
+    total_len: Option<usize>,
+    last_update: Instant,
 }
 
 /// The background task running the LTP engine.
@@ -47,12 +66,14 @@ pub struct Driver {
     config: Config,
     engine: Engine,
     sink: Arc<dyn Sink>,
+    tasks: Arc<TaskPool>,
     cmd_rx: mpsc::Receiver<DriverCommand>,
     start_time: Instant,
     engine_to_addr: HashMap<EngineId, SocketAddr>,
     addr_to_engine: HashMap<SocketAddr, EngineId>,
     engine_to_node: HashMap<EngineId, NodeId>,
     pending_transfers: HashMap<SessionId, Id>,
+    green_reassemblies: HashMap<SessionId, GreenReassembly>,
 }
 
 impl Driver {
@@ -62,6 +83,7 @@ impl Driver {
         sink: Arc<dyn Sink>,
         cmd_rx: mpsc::Receiver<DriverCommand>,
         addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>,
+        tasks: Arc<TaskPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let start_time = Instant::now();
@@ -75,18 +97,28 @@ impl Driver {
                 allowed_client_services: Some(vec![1]),
                 ..Default::default()
             };
-            let engine = Engine::new(engine_cfg);
+            let mut engine = Engine::new(engine_cfg);
+            for peer in &config.peers {
+                if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                    let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+                    let ack_margin_micros =
+                        u64::try_from(ack_margin.as_micros()).unwrap_or(u64::MAX);
+                    engine.set_peer_timing(peer.engine_id, rtt_micros, ack_margin_micros);
+                }
+            }
 
             let mut driver = Self {
                 config,
                 engine,
                 sink,
+                tasks,
                 cmd_rx,
                 start_time,
                 engine_to_addr: HashMap::new(),
                 addr_to_engine: HashMap::new(),
                 engine_to_node: HashMap::new(),
                 pending_transfers: HashMap::new(),
+                green_reassemblies: HashMap::new(),
             };
 
             if let Err(err) = driver.run(addr_tx).await {
@@ -153,6 +185,7 @@ impl Driver {
         info!("LTP UDP transport listening on {local_addr}");
 
         let mut rx_buf = vec![0u8; 65536];
+        let cancel = self.tasks.cancel_token().clone();
 
         loop {
             let now = self.now_micros();
@@ -175,6 +208,10 @@ impl Driver {
             };
 
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!("LTP UDP driver loop cancelled");
+                    break;
+                }
                 // 1. Ingress UDP packet
                 recv_res = socket.recv_from(&mut rx_buf) => {
                     let (len, peer_addr) = match recv_res {
@@ -210,13 +247,20 @@ impl Driver {
                             warn!("received packet from unregistered UDP peer {peer_addr}");
                             EngineId(peer_addr.port() as u64)
                         };
-                        // Associate dynamic peer ephemeral port with known engine, limiting table size
-                        if self.engine_to_addr.contains_key(&id) {
-                            if self.addr_to_engine.len() >= 1024 {
-                                self.addr_to_engine.clear();
-                            }
-                            self.addr_to_engine.insert(peer_addr, id);
-                            self.engine_to_addr.insert(id, peer_addr);
+                        let is_new_peer = !self.engine_to_addr.contains_key(&id);
+                        if self.addr_to_engine.len() >= 1024 {
+                            self.addr_to_engine.clear();
+                        }
+                        self.addr_to_engine.insert(peer_addr, id);
+                        self.engine_to_addr.insert(id, peer_addr);
+
+                        if is_new_peer {
+                            info!("discovered new dynamic LTP peer Engine {id:?} at {peer_addr}");
+                            let cla_addr = engine_id_to_cla_address(id);
+                            let sink = self.sink.clone();
+                            self.tasks.spawn(async move {
+                                let _ = sink.add_peer(cla_addr, &[]).await;
+                            });
                         }
                         id
                     } else {
@@ -269,6 +313,7 @@ impl Driver {
         let mut current_delay = reconnect_initial_delay;
         let connect_timeout = Duration::from_secs(5);
         const MAX_KISS_ACCUMULATOR: usize = 2 * 1024 * 1024; // 2 MiB
+        let cancel = self.tasks.cancel_token().clone();
 
         'reconnect_loop: loop {
             info!("connecting LTP CLA to KISS TCP server at {server_addr}");
@@ -333,6 +378,10 @@ impl Driver {
                             };
 
                             tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    debug!("LTP KISS TCP connected loop cancelled");
+                                    break "driver cancelled";
+                                }
                                 read_res = reader.read(&mut raw_rx_buf) => {
                                     match read_res {
                                         Ok(0) => {
@@ -450,6 +499,11 @@ impl Driver {
                 };
 
                 tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("LTP KISS TCP backoff loop cancelled");
+                        break 'reconnect_loop;
+                    }
+
                     () = &mut backoff_deadline => {
                         // Backoff period elapsed: try reconnecting
                         break;
@@ -485,6 +539,10 @@ impl Driver {
                 red_len,
                 reply_tx,
             } => {
+                if !self.engine_to_addr.contains_key(&destination_engine) {
+                    let _ = reply_tx.send(Ok(ForwardBundleResult::NoNeighbour));
+                    return Ok(true);
+                }
                 let now = self.now_micros();
                 match self
                     .engine
@@ -510,6 +568,24 @@ impl Driver {
                 if let Some(node) = node_id {
                     self.engine_to_node.insert(engine_id, node);
                 }
+                Ok(true)
+            }
+            DriverCommand::UnregisterPeer { engine_id } => {
+                if let Some(addr) = self.engine_to_addr.remove(&engine_id) {
+                    self.addr_to_engine.remove(&addr);
+                }
+                self.engine_to_node.remove(&engine_id);
+                Ok(true)
+            }
+            DriverCommand::SetPeerTiming {
+                engine_id,
+                rtt,
+                ack_margin,
+            } => {
+                let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+                let ack_margin_micros = u64::try_from(ack_margin.as_micros()).unwrap_or(u64::MAX);
+                self.engine
+                    .set_peer_timing(engine_id, rtt_micros, ack_margin_micros);
                 Ok(true)
             }
             DriverCommand::Shutdown => {
@@ -553,39 +629,40 @@ impl Driver {
                         );
                         continue;
                     }
-                    let peer_node = self.engine_to_node.get(&source);
-                    let peer_addr = self
-                        .engine_to_addr
-                        .get(&source)
-                        .map(|s| ClaAddress::Tcp(*s));
+                    let peer_node = self.engine_to_node.get(&source).cloned();
+                    let peer_addr = engine_id_to_cla_address(source);
+                    let sink = self.sink.clone();
 
-                    debug!(
-                        "delivering received bundle ({} bytes) from Engine {:?}",
-                        data.len(),
-                        source
-                    );
-                    let mut bundle_stream = Bytes::from(data);
-                    match self
-                        .sink
-                        .dispatch(peer_node, peer_addr.as_ref(), &mut bundle_stream)
-                        .await
-                    {
-                        Ok(Acceptance::Accepted) => {}
-                        Ok(Acceptance::Refused) => {
-                            warn!("bundle from Engine {source:?} refused by BPA");
+                    self.tasks.spawn(async move {
+                        debug!(
+                            "delivering received bundle ({} bytes) from Engine {:?}",
+                            data.len(),
+                            source
+                        );
+                        let mut bundle_stream = Bytes::from(data);
+                        match sink
+                            .dispatch(peer_node.as_ref(), Some(&peer_addr), &mut bundle_stream)
+                            .await
+                        {
+                            Ok(Acceptance::Accepted) => {}
+                            Ok(Acceptance::Refused) => {
+                                warn!("bundle from Engine {source:?} refused by BPA");
+                            }
+                            Err(err) => {
+                                error!("dispatch to BPA failed: {err}");
+                            }
                         }
-                        Err(err) => {
-                            error!("dispatch to BPA failed: {err}");
-                        }
-                    }
+                    });
                 }
                 Notice::TransmissionSessionCompleted { session } => {
                     if let Some(bundle_id) = self.pending_transfers.remove(&session) {
                         debug!("transmission session {session:?} completed for bundle {bundle_id}");
-                        let _ = self
-                            .sink
-                            .transfer_outcome(&bundle_id, TransferOutcome::Completed)
-                            .await;
+                        let sink = self.sink.clone();
+                        self.tasks.spawn(async move {
+                            let _ = sink
+                                .transfer_outcome(&bundle_id, TransferOutcome::Completed)
+                                .await;
+                        });
                     }
                 }
                 Notice::TransmissionSessionCancelled { session, reason } => {
@@ -593,14 +670,93 @@ impl Driver {
                         warn!(
                             "transmission session {session:?} cancelled ({reason:?}) for bundle {bundle_id}"
                         );
-                        let _ = self
-                            .sink
-                            .transfer_outcome(&bundle_id, TransferOutcome::Failed)
-                            .await;
+                        let sink = self.sink.clone();
+                        self.tasks.spawn(async move {
+                            let _ = sink
+                                .transfer_outcome(&bundle_id, TransferOutcome::Failed)
+                                .await;
+                        });
                     }
                 }
-                Notice::GreenSegmentArrived { .. } => {
-                    // Unreliable green segments
+                Notice::GreenSegmentArrived {
+                    session,
+                    source,
+                    offset,
+                    data,
+                    eob,
+                } => {
+                    let sink = self.sink.clone();
+                    let peer_node = self.engine_to_node.get(&source).cloned();
+                    let peer_addr = engine_id_to_cla_address(source);
+
+                    if offset == 0 && eob {
+                        // Single-segment green block (fast-path)
+                        self.tasks.spawn(async move {
+                            debug!(
+                                "delivering single-segment green bundle ({} bytes) from Engine {:?}",
+                                data.len(),
+                                source
+                            );
+                            let mut bundle_stream = Bytes::from(data);
+                            let _ = sink
+                                .dispatch(peer_node.as_ref(), Some(&peer_addr), &mut bundle_stream)
+                                .await;
+                        });
+                    } else {
+                        // Multi-segment green block reassembly
+                        let entry = self.green_reassemblies.entry(session).or_insert_with(|| {
+                            GreenReassembly {
+                                _source: source,
+                                data: Vec::new(),
+                                received_bytes: 0,
+                                total_len: None,
+                                last_update: Instant::now(),
+                            }
+                        });
+
+                        entry.last_update = Instant::now();
+                        let end_offset = offset as usize + data.len();
+                        if entry.data.len() < end_offset {
+                            entry.data.resize(end_offset, 0);
+                        }
+                        entry.data[offset as usize..end_offset].copy_from_slice(&data);
+                        entry.received_bytes += data.len();
+                        if eob {
+                            entry.total_len = Some(end_offset);
+                        }
+
+                        if let Some(total) = entry.total_len
+                            && entry.received_bytes >= total
+                            && entry.data.len() == total
+                        {
+                            let complete_data = std::mem::take(&mut entry.data);
+                            self.green_reassemblies.remove(&session);
+
+                            self.tasks.spawn(async move {
+                                debug!(
+                                    "delivering reassembled green bundle ({} bytes) from Engine {:?}",
+                                    complete_data.len(),
+                                    source
+                                );
+                                let mut bundle_stream = Bytes::from(complete_data);
+                                let _ = sink
+                                    .dispatch(
+                                        peer_node.as_ref(),
+                                        Some(&peer_addr),
+                                        &mut bundle_stream,
+                                    )
+                                    .await;
+                            });
+                        }
+
+                        // Periodic cleanup of stale green reassemblies (older than 30s)
+                        if self.green_reassemblies.len() > 128 {
+                            let now = Instant::now();
+                            self.green_reassemblies.retain(|_, r| {
+                                now.duration_since(r.last_update) < Duration::from_secs(30)
+                            });
+                        }
+                    }
                 }
             }
         }

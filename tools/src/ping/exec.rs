@@ -158,6 +158,7 @@ async fn exec_builtin_cla(
                     engine_id: peer_engine,
                     address: Some(peer_addr),
                     node_id: Some(peer.clone()),
+                    ..Default::default()
                 }],
                 ..Default::default()
             };
