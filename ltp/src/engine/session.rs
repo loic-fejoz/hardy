@@ -27,6 +27,8 @@ pub struct CheckpointRecord {
     pub is_eob: bool,
     /// Number of times this checkpoint has been transmitted.
     pub retries: u32,
+    /// Monotonic timestamp in microseconds when this checkpoint was initially transmitted.
+    pub transmitted_at: u64,
 }
 
 /// Sender-side session tracking a transmitted block (RFC 5326 §8.1).
@@ -105,6 +107,8 @@ pub struct ReportRecord {
     pub retries: u32,
     /// True once an RA has acknowledged this report.
     pub acked: bool,
+    /// Monotonic timestamp in microseconds when this report was initially transmitted.
+    pub transmitted_at: u64,
 }
 
 /// Receiver-side session tracking an incoming block (RFC 5326 §8.2).

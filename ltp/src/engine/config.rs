@@ -59,3 +59,29 @@ impl Default for EngineConfig {
         }
     }
 }
+
+/// Timing parameters (RTT and ACK margin) for a specific peer LTP engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTiming {
+    /// Round-trip time in microseconds.
+    pub rtt_micros: u64,
+    /// Extra margin added to retransmission timers in microseconds.
+    pub ack_margin_micros: u64,
+}
+
+impl PeerTiming {
+    /// Constructs a new `PeerTiming` descriptor.
+    #[must_use]
+    pub const fn new(rtt_micros: u64, ack_margin_micros: u64) -> Self {
+        Self {
+            rtt_micros,
+            ack_margin_micros,
+        }
+    }
+
+    /// Total timeout duration (RTT + ack margin) in microseconds.
+    #[must_use]
+    pub const fn timeout_duration_micros(&self) -> u64 {
+        self.rtt_micros.saturating_add(self.ack_margin_micros)
+    }
+}

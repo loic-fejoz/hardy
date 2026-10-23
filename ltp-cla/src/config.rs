@@ -48,6 +48,24 @@ pub struct PeerEntry {
     /// Associated BPA Node ID.
     #[cfg_attr(feature = "serde", serde(default))]
     pub node_id: Option<NodeId>,
+    /// Estimated nominal round-trip time for this peer (e.g. GEO ~500ms, cislunar ~3s).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rtt: Option<Duration>,
+    /// Extra margin added to retransmission timers for this peer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ack_margin: Option<Duration>,
+}
+
+impl Default for PeerEntry {
+    fn default() -> Self {
+        Self {
+            engine_id: EngineId(0),
+            address: None,
+            node_id: None,
+            rtt: None,
+            ack_margin: None,
+        }
+    }
 }
 
 /// The underlying link transport utilized by the LTP CLA.

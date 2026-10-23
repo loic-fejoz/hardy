@@ -2261,3 +2261,250 @@ fn test_s38_trailing_bytes_rejected() {
             if consumed < total && total == bytes.len()
     ));
 }
+
+/// Scenario S47: Per-peer timing configuration overrides global default (GEO / Cislunar).
+#[test]
+fn test_s47_per_peer_timing_and_dynamic_override() {
+    let cfg = EngineConfig {
+        engine_id: EngineId(1),
+        rtt_micros: 2_000_000,        // default: 2.0s
+        ack_margin_micros: 1_000_000, // default: 1.0s -> total 3.0s
+        ..Default::default()
+    };
+    let mut engine = Engine::new(cfg);
+
+    // Unconfigured peer defaults to global config
+    let default_timing = engine.peer_timing(EngineId(99));
+    assert_eq!(default_timing.rtt_micros, 2_000_000);
+    assert_eq!(default_timing.ack_margin_micros, 1_000_000);
+    assert_eq!(default_timing.timeout_duration_micros(), 3_000_000);
+
+    // Configure GEO peer (RTT: 500ms, ack_margin: 200ms -> 700ms total)
+    let geo_peer = EngineId(10);
+    engine.set_peer_timing(geo_peer, 500_000, 200_000);
+    let geo_timing = engine.peer_timing(geo_peer);
+    assert_eq!(geo_timing.rtt_micros, 500_000);
+    assert_eq!(geo_timing.ack_margin_micros, 200_000);
+    assert_eq!(geo_timing.timeout_duration_micros(), 700_000);
+
+    // Configure Cislunar peer (RTT: 3.0s, ack_margin: 1.5s -> 4.5s total)
+    let cislunar_peer = EngineId(20);
+    engine.set_peer_timing(cislunar_peer, 3_000_000, 1_500_000);
+    let cislunar_timing = engine.peer_timing(cislunar_peer);
+    assert_eq!(cislunar_timing.rtt_micros, 3_000_000);
+    assert_eq!(cislunar_timing.ack_margin_micros, 1_500_000);
+    assert_eq!(cislunar_timing.timeout_duration_micros(), 4_500_000);
+
+    // Start transmission to GEO peer -> checkpoint deadline must be now + 700ms
+    let now = 10_000_000u64;
+    let _session_geo = engine
+        .request_transmission(geo_peer, 1, Bytes::from_static(b"HELLO GEO"), 9, now)
+        .unwrap();
+    assert_eq!(engine.next_timer_deadline(), Some(now + 700_000));
+
+    // Dynamic update: change GEO peer timing on the fly (e.g. orbit position update)
+    engine.set_peer_timing(geo_peer, 600_000, 200_000);
+    assert_eq!(
+        engine.peer_timing(geo_peer).timeout_duration_micros(),
+        800_000
+    );
+    assert_eq!(engine.peer_timeout_deadline(geo_peer, now), now + 800_000);
+}
+
+/// Scenario S48: Passive in-band RTT measurement via EWMA (RFC 5326 §6.7).
+#[test]
+fn test_s48_passive_rtt_ewma_measurement() {
+    let mut sender = Engine::new(EngineConfig {
+        engine_id: EngineId(1),
+        rtt_micros: 1_000_000, // initial RTT: 1.0s
+        ack_margin_micros: 200_000,
+        ..Default::default()
+    });
+    let mut receiver = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    });
+
+    let target = EngineId(2);
+    sender.set_peer_timing(target, 1_000_000, 200_000);
+
+    // Transmit block at T = 1_000_000
+    let t0 = 1_000_000u64;
+    let _session_id = sender
+        .request_transmission(target, 1, Bytes::from_static(b"PING RTT MEASURE"), 16, t0)
+        .unwrap();
+
+    let mut segments = Vec::new();
+    while let Some((dest, data)) = sender.poll_output() {
+        assert_eq!(dest, target);
+        segments.push(data);
+    }
+
+    // Receiver processes segment at T = 1_250_000 (one-way delay = 250ms)
+    let t_rx = 1_250_000u64;
+    for data in segments {
+        receiver
+            .handle_incoming_segment(EngineId(1), &data, t_rx)
+            .unwrap();
+    }
+
+    let mut report_segments = Vec::new();
+    while let Some((dest, data)) = receiver.poll_output() {
+        assert_eq!(dest, EngineId(1));
+        report_segments.push(data);
+    }
+    assert!(!report_segments.is_empty());
+
+    // Sender receives Report at T = 1_500_000 (observed RTT sample = 500_000us)
+    let t_ack = 1_500_000u64;
+    for data in report_segments {
+        sender
+            .handle_incoming_segment(target, &data, t_ack)
+            .unwrap();
+    }
+
+    // EWMA filter calculation:
+    // Initial: 1_000_000, Sample: 500_000
+    // Expected: (7 * 1_000_000 + 500_000) / 8 = 937_500us
+    let updated_timing = sender.peer_timing(target);
+    assert_eq!(updated_timing.rtt_micros, 937_500);
+    assert_eq!(updated_timing.ack_margin_micros, 200_000);
+
+    // Sender produces ReportAck (RA) for the receiver
+    let mut ra_segments = Vec::new();
+    while let Some((dest, data)) = sender.poll_output() {
+        assert_eq!(dest, target);
+        ra_segments.push(data);
+    }
+    assert!(!ra_segments.is_empty(), "sender must emit ReportAck");
+
+    // Receiver configured with initial RTT = 1_000_000
+    receiver.set_peer_timing(EngineId(1), 1_000_000, 200_000);
+
+    // Receiver receives RA at T = 1_750_000 (Report was sent at t_rx = 1_250_000 -> sample = 500_000us)
+    let t_ra = 1_750_000u64;
+    for data in ra_segments {
+        receiver
+            .handle_incoming_segment(EngineId(1), &data, t_ra)
+            .unwrap();
+    }
+
+    // Receiver EWMA filter: (7 * 1_000_000 + 500_000) / 8 = 937_500us
+    let rx_timing = receiver.peer_timing(EngineId(1));
+    assert_eq!(rx_timing.rtt_micros, 937_500);
+    assert_eq!(rx_timing.ack_margin_micros, 200_000);
+
+    // Direct API verification on update_peer_rtt_sample
+    sender.update_peer_rtt_sample(target, 500_000);
+    assert_eq!(sender.peer_timing(target).rtt_micros, 882_812);
+}
+
+/// Scenario S49: Karn's algorithm: retransmitted checkpoints MUST NOT update RTT sample.
+#[test]
+fn test_s49_karns_algorithm_ignores_retransmitted_checkpoints() {
+    let mut sender = Engine::new(EngineConfig {
+        engine_id: EngineId(1),
+        rtt_micros: 500_000,
+        ack_margin_micros: 100_000,
+        ..Default::default()
+    });
+    let peer = EngineId(2);
+    sender.set_peer_timing(peer, 500_000, 100_000);
+
+    let t0 = 1_000_000u64;
+    let session_id = sender
+        .request_transmission(peer, 1, Bytes::from_static(b"KARN TEST"), 9, t0)
+        .unwrap();
+
+    // Drain initial transmission
+    while sender.poll_output().is_some() {}
+
+    // Checkpoint timer expires at t0 + 600ms -> retransmit checkpoint
+    let t_timeout = t0 + 600_000;
+    sender.handle_timer_tick(t_timeout);
+
+    // Retransmitted checkpoint is in outbound queue
+    let mut rtx_segments = Vec::new();
+    while let Some((_, data)) = sender.poll_output() {
+        rtx_segments.push(data);
+    }
+    assert!(
+        !rtx_segments.is_empty(),
+        "must retransmit checkpoint on timeout"
+    );
+
+    // Report arrives at T = 3_000_000 answering the checkpoint
+    // If Karn's algorithm is respected, this retransmitted checkpoint's ambiguous sample is ignored!
+    let fake_rs = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Report(hardy_ltp::segment::ReportSegment {
+            report_serial: core::num::NonZeroU64::new(1).unwrap(),
+            checkpoint_serial: 1, // matches CP serial 1
+            upper_bound: 9,
+            lower_bound: 0,
+            claims: vec![hardy_ltp::segment::ReceptionClaim {
+                offset: 0,
+                length: 9,
+            }],
+        }),
+    };
+
+    sender
+        .handle_incoming_segment(peer, &fake_rs.encode_to_vec(), 3_000_000)
+        .unwrap();
+
+    // RTT must remain strictly unchanged (500_000), not updated to (3_000_000 - 1_000_000 = 2_000_000)
+    let timing = sender.peer_timing(peer);
+    assert_eq!(timing.rtt_micros, 500_000);
+
+    // Receiver side test of Karn's algorithm:
+    // Create receiver with report that times out and retransmits
+    let mut receiver = Engine::new(EngineConfig {
+        engine_id: EngineId(2),
+        rtt_micros: 400_000,
+        ack_margin_micros: 100_000,
+        ..Default::default()
+    });
+    receiver.set_peer_timing(EngineId(1), 400_000, 100_000);
+
+    let incoming_cp = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: b"RECV KARN",
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &incoming_cp.encode_to_vec(), 1_000_000)
+        .unwrap();
+    while receiver.poll_output().is_some() {}
+
+    // Report timer expires at 1_500_000 (400ms RTT + 100ms margin) -> report is retransmitted
+    receiver.handle_timer_tick(1_500_000);
+
+    // RA arrives later at 3_000_000 -> since report was retransmitted, receiver RTT must NOT update
+    let fake_ra = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::ReportAck { report_serial: 1 },
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &fake_ra.encode_to_vec(), 3_000_000)
+        .unwrap();
+
+    let rx_timing = receiver.peer_timing(EngineId(1));
+    assert_eq!(
+        rx_timing.rtt_micros, 400_000,
+        "retransmitted report must not update receiver RTT"
+    );
+}

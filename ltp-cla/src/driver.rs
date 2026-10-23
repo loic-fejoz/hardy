@@ -42,6 +42,12 @@ pub enum DriverCommand {
     },
     /// Unregister a remote peer and remove its routing associations.
     UnregisterPeer { engine_id: EngineId },
+    /// Configure or dynamically update the RTT and ACK margin for a remote peer engine.
+    SetPeerTiming {
+        engine_id: EngineId,
+        rtt: Duration,
+        ack_margin: Duration,
+    },
     /// Gracefully shutdown the driver task.
     Shutdown,
 }
@@ -91,7 +97,15 @@ impl Driver {
                 allowed_client_services: Some(vec![1]),
                 ..Default::default()
             };
-            let engine = Engine::new(engine_cfg);
+            let mut engine = Engine::new(engine_cfg);
+            for peer in &config.peers {
+                if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                    let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+                    let ack_margin_micros =
+                        u64::try_from(ack_margin.as_micros()).unwrap_or(u64::MAX);
+                    engine.set_peer_timing(peer.engine_id, rtt_micros, ack_margin_micros);
+                }
+            }
 
             let mut driver = Self {
                 config,
@@ -561,6 +575,17 @@ impl Driver {
                     self.addr_to_engine.remove(&addr);
                 }
                 self.engine_to_node.remove(&engine_id);
+                Ok(true)
+            }
+            DriverCommand::SetPeerTiming {
+                engine_id,
+                rtt,
+                ack_margin,
+            } => {
+                let rtt_micros = u64::try_from(rtt.as_micros()).unwrap_or(u64::MAX);
+                let ack_margin_micros = u64::try_from(ack_margin.as_micros()).unwrap_or(u64::MAX);
+                self.engine
+                    .set_peer_timing(engine_id, rtt_micros, ack_margin_micros);
                 Ok(true)
             }
             DriverCommand::Shutdown => {

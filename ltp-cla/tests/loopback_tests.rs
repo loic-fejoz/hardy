@@ -116,6 +116,7 @@ async fn test_udp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -137,6 +138,7 @@ async fn test_udp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -280,6 +282,7 @@ async fn test_kiss_tcp_cla_nominal_transfer() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: Some(node_id_2.clone()),
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -298,6 +301,7 @@ async fn test_kiss_tcp_cla_nominal_transfer() {
             engine_id: EngineId(1),
             address: Some(server_addr),
             node_id: Some(node_id_1.clone()),
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -395,6 +399,7 @@ async fn test_kiss_tcp_reconnection_and_backoff() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
 
@@ -485,11 +490,13 @@ async fn test_s17_multi_station_kiss_tcp_peer_resolution() {
                 engine_id: EngineId(2),
                 address: None, // Defaults to server_addr
                 node_id: Some("dtn://station2/".parse().unwrap()),
+                ..Default::default()
             },
             PeerEntry {
                 engine_id: EngineId(3),
                 address: None, // Defaults to server_addr
                 node_id: Some("dtn://station3/".parse().unwrap()),
+                ..Default::default()
             },
         ],
     };
@@ -581,6 +588,7 @@ async fn test_s18_driver_shutdown_notifies_pending_transfers() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
 
@@ -643,6 +651,7 @@ async fn test_s37_udp_keepalive_packet_discarded() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -746,6 +755,7 @@ async fn test_s39_udp_peer_port_migration_dynamic_rebinding() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()), // Dummy address updated dynamically
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -863,6 +873,7 @@ async fn test_s40_udp_addr_to_engine_table_eviction() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -982,6 +993,7 @@ async fn test_s41_kiss_tcp_extreme_stream_fragmentation() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1103,6 +1115,7 @@ async fn test_s42_kiss_tcp_accumulator_overflow_and_recovery() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1220,6 +1233,7 @@ async fn test_s43_kiss_tcp_non_data_commands_ignored() {
             engine_id: EngineId(2),
             address: Some(server_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1349,6 +1363,7 @@ async fn test_s44_transfer_outcome_failed_on_remote_cancellation_or_timeout() {
             engine_id: EngineId(2),
             address: Some(mock_addr),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1430,6 +1445,7 @@ async fn test_s45_client_service_filtered_before_dispatch() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla = LtpCla::new(cfg);
@@ -1515,6 +1531,7 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
             engine_id: EngineId(2),
             address: Some("127.0.0.1:9".parse().unwrap()),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_1 = LtpCla::new(cfg_1);
@@ -1536,6 +1553,7 @@ async fn test_s46_concurrent_bidirectional_multi_bundle_stress() {
             engine_id: EngineId(1),
             address: Some(addr_1),
             node_id: None,
+            ..Default::default()
         }],
     };
     let cla_2 = LtpCla::new(cfg_2);
@@ -2109,4 +2127,105 @@ async fn test_unregister_peer_lifecycle() {
     assert!(matches!(res2, ForwardBundleResult::NoNeighbour));
 
     cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_dynamic_peer_timing_geo_and_cislunar() {
+    let (disp_1_tx, _) = mpsc::channel(16);
+    let (outc_1_tx, _) = mpsc::channel(16);
+    let sink_1 = Box::new(MockSink {
+        dispatches: disp_1_tx,
+        outcomes: outc_1_tx,
+    });
+
+    let (disp_2_tx, mut disp_2_rx) = mpsc::channel(16);
+    let (outc_2_tx, _) = mpsc::channel(16);
+    let sink_2 = Box::new(MockSink {
+        dispatches: disp_2_tx,
+        outcomes: outc_2_tx,
+    });
+
+    // Node 1 configured with peer 2 having initial GEO timing (RTT = 500ms, ack_margin = 200ms)
+    let cfg_1 = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        peers: vec![PeerEntry {
+            engine_id: EngineId(2),
+            address: Some("127.0.0.1:9".parse().unwrap()),
+            node_id: None,
+            rtt: Some(Duration::from_millis(500)),
+            ack_margin: Some(Duration::from_millis(200)),
+        }],
+        ..Default::default()
+    };
+    let cla_1 = LtpCla::new(cfg_1);
+    assert_eq!(
+        cla_1.peer_timing(EngineId(2)).await,
+        Some((Duration::from_millis(500), Duration::from_millis(200)))
+    );
+    assert_eq!(cla_1.peer_timing(EngineId(999)).await, None);
+    cla_1.on_register(sink_1, &[], None).await;
+
+    // Node 2 listening
+    let cfg_2 = Config {
+        engine_id: EngineId(2),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        max_segment_payload_len: 1024,
+        ..Default::default()
+    };
+    let cla_2 = LtpCla::new(cfg_2);
+    cla_2.on_register(sink_2, &[], None).await;
+    let addr_2 = cla_2.local_addr().await.unwrap();
+
+    // Dynamically update peer 2's socket address and re-tune to Cislunar timing (RTT = 3.0s, ack_margin = 1.0s)
+    cla_1
+        .register_peer(EngineId(2), addr_2, None)
+        .await
+        .unwrap();
+    cla_1
+        .set_peer_timing(EngineId(2), Duration::from_secs(3), Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        cla_1.peer_timing(EngineId(2)).await,
+        Some((Duration::from_secs(3), Duration::from_secs(1)))
+    );
+
+    let target_cla_addr = engine_id_to_cla_address(EngineId(2));
+    let bundle_id = create_test_bundle_id("cislunar-bundle");
+    let payload = vec![0x33u8; 128];
+    let mut stream = Bytes::copy_from_slice(&payload);
+
+    let res = cla_1
+        .forward(
+            None,
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Receiver should receive the complete bundle
+    let (_node, _cla_addr, received_payload) =
+        tokio::time::timeout(Duration::from_secs(5), disp_2_rx.recv())
+            .await
+            .expect("the timeout only bounds a regression")
+            .expect("must receive bundle");
+
+    assert_eq!(received_payload, payload);
+
+    // Unregister peer clears peer timing
+    cla_1.unregister_peer(EngineId(2)).await.unwrap();
+    assert_eq!(cla_1.peer_timing(EngineId(2)).await, None);
+
+    cla_1.unregister().await;
+    cla_2.unregister().await;
 }

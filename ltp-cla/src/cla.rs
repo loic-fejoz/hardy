@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -57,16 +58,24 @@ pub struct LtpCla {
     config: Config,
     inner: Arc<RwLock<Option<ClaInner>>>,
     peer_mappings: Arc<RwLock<HashMap<ClaAddress, EngineId>>>,
+    peer_timings: Arc<RwLock<HashMap<EngineId, (Duration, Duration)>>>,
 }
 
 impl LtpCla {
     /// Creates a new LTP CLA instance with the given configuration.
     #[must_use]
     pub fn new(config: Config) -> Self {
+        let mut peer_timings = HashMap::new();
+        for peer in &config.peers {
+            if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                peer_timings.insert(peer.engine_id, (rtt, ack_margin));
+            }
+        }
         Self {
             config,
             inner: Arc::new(RwLock::new(None)),
             peer_mappings: Arc::new(RwLock::new(HashMap::new())),
+            peer_timings: Arc::new(RwLock::new(peer_timings)),
         }
     }
 
@@ -75,6 +84,11 @@ impl LtpCla {
         let inner_guard = self.inner.read().await;
         let inner = inner_guard.as_ref().ok_or(Error::NotRegistered)?;
         Ok(inner.local_addr)
+    }
+
+    /// Returns the currently configured timing (RTT, ACK margin) for a peer, if set.
+    pub async fn peer_timing(&self, engine_id: EngineId) -> Option<(Duration, Duration)> {
+        self.peer_timings.read().await.get(&engine_id).copied()
     }
 
     /// Returns the initialisation parameters for registering this CLA with the BPA.
@@ -131,6 +145,7 @@ impl LtpCla {
     pub async fn unregister_peer(&self, engine_id: EngineId) -> Result<()> {
         let cla_addr = engine_id_to_cla_address(engine_id);
         self.peer_mappings.write().await.remove(&cla_addr);
+        self.peer_timings.write().await.remove(&engine_id);
 
         let inner_guard = self.inner.read().await;
         if let Some(inner) = inner_guard.as_ref() {
@@ -142,6 +157,32 @@ impl LtpCla {
                 .map_err(|_| Error::DriverClosed)?;
         }
 
+        Ok(())
+    }
+
+    /// Configures or dynamically updates the round-trip time and ACK margin for a remote peer engine (e.g. from TVR).
+    pub async fn set_peer_timing(
+        &self,
+        engine_id: EngineId,
+        rtt: Duration,
+        ack_margin: Duration,
+    ) -> Result<()> {
+        self.peer_timings
+            .write()
+            .await
+            .insert(engine_id, (rtt, ack_margin));
+        let inner_guard = self.inner.read().await;
+        if let Some(inner) = inner_guard.as_ref() {
+            inner
+                .cmd_tx
+                .send(DriverCommand::SetPeerTiming {
+                    engine_id,
+                    rtt,
+                    ack_margin,
+                })
+                .await
+                .map_err(|_| Error::DriverClosed)?;
+        }
         Ok(())
     }
 
@@ -220,6 +261,15 @@ impl Cla for LtpCla {
                     })
                     .await;
             }
+            if let (Some(rtt), Some(ack_margin)) = (peer.rtt, peer.ack_margin) {
+                let _ = cmd_tx
+                    .send(DriverCommand::SetPeerTiming {
+                        engine_id: peer.engine_id,
+                        rtt,
+                        ack_margin,
+                    })
+                    .await;
+            }
         }
 
         // Pre-populate driver with any dynamically configured peer mappings
@@ -234,6 +284,17 @@ impl Cla for LtpCla {
                     })
                     .await;
             }
+        }
+
+        let timings = self.peer_timings.read().await;
+        for (&engine_id, &(rtt, ack_margin)) in timings.iter() {
+            let _ = cmd_tx
+                .send(DriverCommand::SetPeerTiming {
+                    engine_id,
+                    rtt,
+                    ack_margin,
+                })
+                .await;
         }
 
         let mut inner_guard = self.inner.write().await;
