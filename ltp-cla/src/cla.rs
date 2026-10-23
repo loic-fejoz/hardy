@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{debug, info};
 
+use hardy_async::TaskPool;
 use hardy_bpa::async_trait;
 use hardy_bpa::cla::{Cla, ClaAddress, ForwardBundleResult, Result as ClaResult, Segment, Sink};
 use hardy_bpa::stream::{Receiver, buffer_stream};
@@ -23,6 +24,7 @@ use crate::error::{Error, Result};
 /// Inner state of the LTP CLA.
 struct ClaInner {
     sink: Arc<dyn Sink>,
+    tasks: Arc<TaskPool>,
     cmd_tx: mpsc::Sender<DriverCommand>,
     local_addr: SocketAddr,
     _driver_handle: tokio::task::JoinHandle<()>,
@@ -113,8 +115,9 @@ impl LtpCla {
         let mut inner_guard = self.inner.write().await;
         if let Some(inner) = inner_guard.take() {
             inner.sink.unregister().await;
-            drop(inner.cmd_tx);
+            let _ = inner.cmd_tx.send(DriverCommand::Shutdown).await;
             let _ = inner._driver_handle.await;
+            inner.tasks.shutdown().await;
         }
     }
 }
@@ -135,7 +138,14 @@ impl Cla for LtpCla {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (addr_tx, addr_rx) = oneshot::channel();
 
-        let driver_handle = Driver::spawn(self.config.clone(), sink.clone(), cmd_rx, addr_tx);
+        let tasks = Arc::new(TaskPool::new());
+        let driver_handle = Driver::spawn(
+            self.config.clone(),
+            sink.clone(),
+            cmd_rx,
+            addr_tx,
+            tasks.clone(),
+        );
         let local_addr = match addr_rx.await {
             Ok(Ok(addr)) => addr,
             Ok(Err(e)) => {
@@ -194,6 +204,7 @@ impl Cla for LtpCla {
         let mut inner_guard = self.inner.write().await;
         *inner_guard = Some(ClaInner {
             sink,
+            tasks,
             cmd_tx,
             local_addr,
             _driver_handle: driver_handle,
@@ -206,6 +217,7 @@ impl Cla for LtpCla {
         if let Some(inner) = inner_guard.take() {
             let _ = inner.cmd_tx.send(DriverCommand::Shutdown).await;
             let _ = inner._driver_handle.await;
+            inner.tasks.shutdown().await;
         }
     }
 

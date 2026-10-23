@@ -11,6 +11,7 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
+use hardy_async::TaskPool;
 use hardy_bpa::cla::{Acceptance, ForwardBundleResult, Sink, TransferOutcome};
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
@@ -48,6 +49,7 @@ pub struct Driver {
     config: Config,
     engine: Engine,
     sink: Arc<dyn Sink>,
+    tasks: Arc<TaskPool>,
     cmd_rx: mpsc::Receiver<DriverCommand>,
     start_time: Instant,
     engine_to_addr: HashMap<EngineId, SocketAddr>,
@@ -63,6 +65,7 @@ impl Driver {
         sink: Arc<dyn Sink>,
         cmd_rx: mpsc::Receiver<DriverCommand>,
         addr_tx: oneshot::Sender<std::io::Result<SocketAddr>>,
+        tasks: Arc<TaskPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let start_time = Instant::now();
@@ -82,6 +85,7 @@ impl Driver {
                 config,
                 engine,
                 sink,
+                tasks,
                 cmd_rx,
                 start_time,
                 engine_to_addr: HashMap::new(),
@@ -154,6 +158,7 @@ impl Driver {
         info!("LTP UDP transport listening on {local_addr}");
 
         let mut rx_buf = vec![0u8; 65536];
+        let cancel = self.tasks.cancel_token().clone();
 
         loop {
             let now = self.now_micros();
@@ -176,6 +181,10 @@ impl Driver {
             };
 
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!("LTP UDP driver loop cancelled");
+                    break;
+                }
                 // 1. Ingress UDP packet
                 recv_res = socket.recv_from(&mut rx_buf) => {
                     let (len, peer_addr) = match recv_res {
@@ -270,6 +279,7 @@ impl Driver {
         let mut current_delay = reconnect_initial_delay;
         let connect_timeout = Duration::from_secs(5);
         const MAX_KISS_ACCUMULATOR: usize = 2 * 1024 * 1024; // 2 MiB
+        let cancel = self.tasks.cancel_token().clone();
 
         'reconnect_loop: loop {
             info!("connecting LTP CLA to KISS TCP server at {server_addr}");
@@ -334,6 +344,10 @@ impl Driver {
                             };
 
                             tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    debug!("LTP KISS TCP connected loop cancelled");
+                                    break "driver cancelled";
+                                }
                                 read_res = reader.read(&mut raw_rx_buf) => {
                                     match read_res {
                                         Ok(0) => {
@@ -451,6 +465,11 @@ impl Driver {
                 };
 
                 tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("LTP KISS TCP backoff loop cancelled");
+                        break 'reconnect_loop;
+                    }
+
                     () = &mut backoff_deadline => {
                         // Backoff period elapsed: try reconnecting
                         break;
@@ -554,36 +573,40 @@ impl Driver {
                         );
                         continue;
                     }
-                    let peer_node = self.engine_to_node.get(&source);
+                    let peer_node = self.engine_to_node.get(&source).cloned();
                     let peer_addr = engine_id_to_cla_address(source);
+                    let sink = self.sink.clone();
 
-                    debug!(
-                        "delivering received bundle ({} bytes) from Engine {:?}",
-                        data.len(),
-                        source
-                    );
-                    let mut bundle_stream = Bytes::from(data);
-                    match self
-                        .sink
-                        .dispatch(peer_node, Some(&peer_addr), &mut bundle_stream)
-                        .await
-                    {
-                        Ok(Acceptance::Accepted) => {}
-                        Ok(Acceptance::Refused) => {
-                            warn!("bundle from Engine {source:?} refused by BPA");
+                    self.tasks.spawn(async move {
+                        debug!(
+                            "delivering received bundle ({} bytes) from Engine {:?}",
+                            data.len(),
+                            source
+                        );
+                        let mut bundle_stream = Bytes::from(data);
+                        match sink
+                            .dispatch(peer_node.as_ref(), Some(&peer_addr), &mut bundle_stream)
+                            .await
+                        {
+                            Ok(Acceptance::Accepted) => {}
+                            Ok(Acceptance::Refused) => {
+                                warn!("bundle from Engine {source:?} refused by BPA");
+                            }
+                            Err(err) => {
+                                error!("dispatch to BPA failed: {err}");
+                            }
                         }
-                        Err(err) => {
-                            error!("dispatch to BPA failed: {err}");
-                        }
-                    }
+                    });
                 }
                 Notice::TransmissionSessionCompleted { session } => {
                     if let Some(bundle_id) = self.pending_transfers.remove(&session) {
                         debug!("transmission session {session:?} completed for bundle {bundle_id}");
-                        let _ = self
-                            .sink
-                            .transfer_outcome(&bundle_id, TransferOutcome::Completed)
-                            .await;
+                        let sink = self.sink.clone();
+                        self.tasks.spawn(async move {
+                            let _ = sink
+                                .transfer_outcome(&bundle_id, TransferOutcome::Completed)
+                                .await;
+                        });
                     }
                 }
                 Notice::TransmissionSessionCancelled { session, reason } => {
@@ -591,10 +614,12 @@ impl Driver {
                         warn!(
                             "transmission session {session:?} cancelled ({reason:?}) for bundle {bundle_id}"
                         );
-                        let _ = self
-                            .sink
-                            .transfer_outcome(&bundle_id, TransferOutcome::Failed)
-                            .await;
+                        let sink = self.sink.clone();
+                        self.tasks.spawn(async move {
+                            let _ = sink
+                                .transfer_outcome(&bundle_id, TransferOutcome::Failed)
+                                .await;
+                        });
                     }
                 }
                 Notice::GreenSegmentArrived { .. } => {
