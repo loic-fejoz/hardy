@@ -127,6 +127,24 @@ impl LtpCla {
         Ok(())
     }
 
+    /// Unregisters a peer and removes it from the BPA routing table.
+    pub async fn unregister_peer(&self, engine_id: EngineId) -> Result<()> {
+        let cla_addr = engine_id_to_cla_address(engine_id);
+        self.peer_mappings.write().await.remove(&cla_addr);
+
+        let inner_guard = self.inner.read().await;
+        if let Some(inner) = inner_guard.as_ref() {
+            let _ = inner.sink.remove_peer(&cla_addr).await;
+            inner
+                .cmd_tx
+                .send(DriverCommand::UnregisterPeer { engine_id })
+                .await
+                .map_err(|_| Error::DriverClosed)?;
+        }
+
+        Ok(())
+    }
+
     /// Unregisters this CLA from the BPA and shuts down the background driver.
     pub async fn unregister(&self) {
         let mut inner_guard = self.inner.write().await;
@@ -272,9 +290,7 @@ impl Cla for LtpCla {
             } else if let Some(id) = cla_address_to_engine_id(cla_addr) {
                 id
             } else {
-                return Err(hardy_bpa::cla::Error::from(
-                    crate::error::Error::UnknownPeer(cla_addr.clone()),
-                ));
+                return Ok(ForwardBundleResult::NoNeighbour);
             }
         };
 

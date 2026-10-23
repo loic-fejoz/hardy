@@ -40,6 +40,8 @@ pub enum DriverCommand {
         addr: SocketAddr,
         node_id: Option<NodeId>,
     },
+    /// Unregister a remote peer and remove its routing associations.
+    UnregisterPeer { engine_id: EngineId },
     /// Gracefully shutdown the driver task.
     Shutdown,
 }
@@ -523,6 +525,10 @@ impl Driver {
                 red_len,
                 reply_tx,
             } => {
+                if !self.engine_to_addr.contains_key(&destination_engine) {
+                    let _ = reply_tx.send(Ok(ForwardBundleResult::NoNeighbour));
+                    return Ok(true);
+                }
                 let now = self.now_micros();
                 match self
                     .engine
@@ -548,6 +554,13 @@ impl Driver {
                 if let Some(node) = node_id {
                     self.engine_to_node.insert(engine_id, node);
                 }
+                Ok(true)
+            }
+            DriverCommand::UnregisterPeer { engine_id } => {
+                if let Some(addr) = self.engine_to_addr.remove(&engine_id) {
+                    self.addr_to_engine.remove(&addr);
+                }
+                self.engine_to_node.remove(&engine_id);
                 Ok(true)
             }
             DriverCommand::Shutdown => {

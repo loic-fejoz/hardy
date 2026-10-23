@@ -3,6 +3,7 @@
 //! Tests UDP datagram transport (RFC 7122) and KISS over TCP transport
 //! using local loopback and mock BPA sinks.
 
+use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 use std::vec::Vec;
@@ -1846,6 +1847,9 @@ async fn test_max_bundle_size_enforcement() {
         ..Default::default()
     };
     let cla = LtpCla::new(cfg);
+    cla.register_peer(EngineId(2), "127.0.0.1:9999".parse().unwrap(), None)
+        .await
+        .unwrap();
     // Register with a cap of 1000 bytes
     cla.on_register(sink, &[], NonZeroU64::new(1000)).await;
 
@@ -1898,6 +1902,7 @@ async fn test_max_bundle_size_enforcement() {
 
 struct PeerTrackingSink {
     peers_added: mpsc::Sender<(ClaAddress, Vec<NodeId>)>,
+    peers_removed: Option<mpsc::Sender<ClaAddress>>,
 }
 
 #[async_trait]
@@ -1915,7 +1920,10 @@ impl Sink for PeerTrackingSink {
         let _ = self.peers_added.send((addr, nodes.to_vec())).await;
         Ok(true)
     }
-    async fn remove_peer(&self, _: &ClaAddress) -> ClaResult<bool> {
+    async fn remove_peer(&self, addr: &ClaAddress) -> ClaResult<bool> {
+        if let Some(ref tx) = self.peers_removed {
+            let _ = tx.send(addr.clone()).await;
+        }
         Ok(true)
     }
     async fn transfer_outcome(&self, _: &Id, _: TransferOutcome) -> ClaResult<()> {
@@ -1928,6 +1936,7 @@ async fn test_dynamic_peer_discovery_registers_with_sink() {
     let (peer_tx, mut peer_rx) = mpsc::channel(16);
     let sink = Box::new(PeerTrackingSink {
         peers_added: peer_tx,
+        peers_removed: None,
     });
 
     let cfg = Config {
@@ -1971,6 +1980,133 @@ async fn test_dynamic_peer_discovery_registers_with_sink() {
 
     assert_eq!(discovered_addr, engine_id_to_cla_address(remote_engine));
     assert!(nodes.is_empty());
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_forward_to_unreachable_neighbor_returns_no_neighbour() {
+    let (disp_tx, _) = mpsc::channel(16);
+    let (outc_tx, _) = mpsc::channel(16);
+    let sink = Box::new(MockSink {
+        dispatches: disp_tx,
+        outcomes: outc_tx,
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        peers: Vec::new(),
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    // 1. Peer address that cannot be parsed as an EngineId
+    let bundle_id = create_test_bundle_id("no-neighbour");
+    let payload = vec![0x11u8; 64];
+    let mut stream = Bytes::copy_from_slice(&payload);
+    let unparseable_addr = ClaAddress::Tcp("127.0.0.1:9".parse().unwrap());
+
+    let res1 = cla
+        .forward(
+            None,
+            &unparseable_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res1, ForwardBundleResult::NoNeighbour));
+
+    // 2. Peer with a valid EngineId format, but no known network address endpoint
+    let mut stream2 = Bytes::copy_from_slice(&payload);
+    let disconnected_addr = engine_id_to_cla_address(EngineId(888));
+
+    let res2 = cla
+        .forward(
+            None,
+            &disconnected_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res2, ForwardBundleResult::NoNeighbour));
+
+    cla.unregister().await;
+}
+
+#[tokio::test]
+async fn test_unregister_peer_lifecycle() {
+    let (peer_add_tx, _) = mpsc::channel(16);
+    let (peer_rem_tx, mut peer_rem_rx) = mpsc::channel(16);
+    let sink = Box::new(PeerTrackingSink {
+        peers_added: peer_add_tx,
+        peers_removed: Some(peer_rem_tx),
+    });
+
+    let cfg = Config {
+        engine_id: EngineId(1),
+        transport: TransportMode::Udp {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        ..Default::default()
+    };
+    let cla = LtpCla::new(cfg);
+    cla.on_register(sink, &[], None).await;
+
+    let target_engine = EngineId(42);
+    let target_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    cla.register_peer(target_engine, target_addr, None)
+        .await
+        .unwrap();
+
+    let target_cla_addr = engine_id_to_cla_address(target_engine);
+
+    // Forward succeeds while neighbor is registered
+    let payload = vec![0x22u8; 64];
+    let bundle_id = create_test_bundle_id("contact-open");
+    let mut stream = Bytes::copy_from_slice(&payload);
+    let res = cla
+        .forward(
+            Some(1),
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res, ForwardBundleResult::Accepted));
+
+    // Simulate contact closing: unregister peer
+    cla.unregister_peer(target_engine).await.unwrap();
+
+    // Verify sink.remove_peer was notified
+    let removed = tokio::time::timeout(Duration::from_secs(5), peer_rem_rx.recv())
+        .await
+        .expect("the timeout only bounds a regression")
+        .expect("must receive removed peer notification");
+    assert_eq!(removed, target_cla_addr);
+
+    // Forward now returns NoNeighbour
+    let mut stream2 = Bytes::copy_from_slice(&payload);
+    let res2 = cla
+        .forward(
+            Some(1),
+            &target_cla_addr,
+            &bundle_id,
+            payload.len() as u64,
+            &mut stream2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(res2, ForwardBundleResult::NoNeighbour));
 
     cla.unregister().await;
 }
