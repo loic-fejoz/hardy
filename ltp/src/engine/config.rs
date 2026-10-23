@@ -1,5 +1,7 @@
 //! Configuration parameters for an LTP engine instance.
 
+use alloc::vec::Vec;
+
 use crate::types::EngineId;
 
 /// Configuration parameters for an LTP engine.
@@ -31,6 +33,10 @@ pub struct EngineConfig {
     pub max_reports_per_session: usize,
     /// Maximum reception claims included in a single report segment (default 20, RFC 5326 / ION limit).
     pub max_claims_per_report: usize,
+    /// Allowed client service IDs (RFC 5326 §6.2).
+    /// If `None`, any client service ID is accepted. If `Some(services)`, segments targeting
+    /// an unregistered client service ID trigger session cancellation with `CR(UNREACH)`.
+    pub allowed_client_services: Option<Vec<u64>>,
 }
 
 impl Default for EngineConfig {
@@ -49,6 +55,7 @@ impl Default for EngineConfig {
             max_recv_sessions: 1024,
             max_reports_per_session: 64,
             max_claims_per_report: 20,
+            allowed_client_services: None,
         }
     }
 }

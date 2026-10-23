@@ -72,6 +72,7 @@ impl Driver {
                 report_rtx_limit: config.report_rtx_limit,
                 rtt_micros: u64::try_from(config.rtt.as_micros()).unwrap_or(u64::MAX),
                 ack_margin_micros: u64::try_from(config.ack_margin.as_micros()).unwrap_or(u64::MAX),
+                allowed_client_services: Some(vec![1]),
                 ..Default::default()
             };
             let engine = Engine::new(engine_cfg);
@@ -183,10 +184,20 @@ impl Driver {
                             continue;
                         }
                     };
+
+                    if len == 4 && rx_buf[..4] == [0, 0, 0, 0] {
+                        // RFC 7122 §3.3 & §3.4: 4-octet keep-alive packet MUST be discarded
+                        trace!("discarding 4-octet keep-alive datagram from {peer_addr}");
+                        continue;
+                    }
+
                     let now = self.now_micros();
 
                     // Resolve peer engine ID using peek_session to avoid full allocation
                     let peer_engine = if let Some(&id) = self.addr_to_engine.get(&peer_addr) {
+                        if self.engine_to_addr.contains_key(&id) {
+                            self.engine_to_addr.insert(id, peer_addr);
+                        }
                         id
                     } else if let Ok(session) = Segment::peek_session(&rx_buf[..len]) {
                         let id = if session.originator != self.config.engine_id {
@@ -205,6 +216,7 @@ impl Driver {
                                 self.addr_to_engine.clear();
                             }
                             self.addr_to_engine.insert(peer_addr, id);
+                            self.engine_to_addr.insert(id, peer_addr);
                         }
                         id
                     } else {
@@ -531,10 +543,16 @@ impl Driver {
                 Notice::RedPartReceived {
                     session: _,
                     source,
-                    client_service: _,
+                    client_service,
                     data,
                     eob: _,
                 } => {
+                    if client_service != 1 {
+                        warn!(
+                            "ignoring received red-part for unsupported client service {client_service}"
+                        );
+                        continue;
+                    }
                     let peer_node = self.engine_to_node.get(&source);
                     let peer_addr = self
                         .engine_to_addr

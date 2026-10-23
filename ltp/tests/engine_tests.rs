@@ -1,10 +1,12 @@
 //! Deterministic integration tests for the Sans-I/O LTP Engine.
 
-use bytes::Bytes;
+use core::num::NonZeroU64;
 use std::vec::Vec;
 
+use bytes::Bytes;
+
 use hardy_ltp::engine::{Engine, EngineConfig, Notice};
-use hardy_ltp::types::{CancelReason, EngineId};
+use hardy_ltp::types::{CancelReason, EngineId, SessionId};
 
 #[test]
 fn nominal_red_block_transfer() {
@@ -571,22 +573,6 @@ fn test_s10_segmented_reports_max_claims() {
     // Feed 15 non-contiguous 10-byte slices: 0..10, 20..30, 40..50, ... 280..290
     for i in 0..15 {
         let offset = i * 20;
-        let is_last = i == 14;
-        let checkpoint = if is_last {
-            Some(hardy_ltp::segment::Checkpoint {
-                serial: core::num::NonZeroU64::new(1).unwrap(),
-                report_serial: 0,
-            })
-        } else {
-            None
-        };
-
-        let kind = if let Some(cp) = checkpoint {
-            hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp)
-        } else {
-            hardy_ltp::segment::DataSegKind::Red
-        };
-
         let seg = hardy_ltp::segment::Segment {
             session: session_id,
             header_ext: Vec::new(),
@@ -594,7 +580,7 @@ fn test_s10_segmented_reports_max_claims() {
             body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
                 client_service: 1,
                 offset,
-                kind,
+                kind: hardy_ltp::segment::DataSegKind::Red,
                 data: &[0xAA; 10],
             }),
         };
@@ -603,6 +589,25 @@ fn test_s10_segmented_reports_max_claims() {
             .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), 1_000_000)
             .unwrap();
     }
+
+    // Send a 0-length checkpoint at offset 300 (trailing gap 290..300)
+    let cp_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 300,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(hardy_ltp::segment::Checkpoint {
+                serial: core::num::NonZeroU64::new(1).unwrap(),
+                report_serial: 0,
+            }),
+            data: &[],
+        }),
+    };
+    engine
+        .handle_incoming_segment(EngineId(1), &cp_seg.encode_to_vec(), 1_000_000)
+        .unwrap();
 
     // Engine must partition the 15 claims into 3 distinct reports of <= 5 claims each!
     let mut reports = Vec::new();
@@ -615,6 +620,9 @@ fn test_s10_segmented_reports_max_claims() {
     }
 
     assert_eq!(reports.len(), 3, "15 claims / 5 per report = 3 reports");
+    assert_eq!(reports[0].upper_bound, 90);
+    assert_eq!(reports[1].upper_bound, 190);
+    assert_eq!(reports[2].upper_bound, 300);
 }
 
 #[test]
@@ -1679,5 +1687,577 @@ fn test_s30_empty_block_transfer() {
         Some(Notice::TransmissionSessionCompleted {
             session,
         }) if session == session_id
+    ));
+}
+
+/// Scenario S31: Unregistered Client Service ID rejection (RFC 5326 §6.2, §6.19 & §8.2).
+///
+/// When a data segment arrives targeting an unregistered client service ID, the receiver
+/// MUST discard the payload and issue a CancelReceiver (CR) segment with reason UNREACH.
+#[test]
+fn test_s31_unregistered_client_service_triggers_cancel_unreach() {
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        allowed_client_services: Some(vec![1]), // Only Client Service 1 (BPv7) registered
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 100,
+    };
+    let now = 1_000_000u64;
+
+    // Craft incoming data segment with unregistered client_service = 42
+    let cp = hardy_ltp::segment::Checkpoint {
+        serial: NonZeroU64::new(1).unwrap(),
+        report_serial: 0,
+    };
+    let seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 42,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp),
+            data: &[0xAA; 100],
+        }),
+    };
+
+    receiver
+        .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), now)
+        .unwrap();
+
+    // 1. Notice emitted for cancellation with reason Unreach
+    assert_eq!(
+        receiver.poll_notice(),
+        Some(Notice::TransmissionSessionCancelled {
+            session: session_id,
+            reason: CancelReason::Unreach,
+        })
+    );
+    // No data was delivered to any client service
+    assert_eq!(receiver.poll_notice(), None);
+
+    // 2. Outbound CancelReceiver (CR) segment with reason Unreach was emitted
+    let (dest, raw_cr) = receiver.poll_output().expect("outbound CR expected");
+    assert_eq!(dest, EngineId(1));
+    let (decoded, _) = hardy_ltp::segment::Segment::parse(&raw_cr).unwrap();
+    assert_eq!(
+        decoded.body,
+        hardy_ltp::segment::SegmentBody::CancelReceiver {
+            reason: CancelReason::Unreach
+        }
+    );
+}
+
+/// Scenario S32: Receiver Report Segment retry limit exceeded triggers CR(RLEXC) (RFC 5326 §6.8 & §6.20).
+///
+/// When an issued Report Segment (RS) is never acknowledged by the sender (all RA lost),
+/// the receiver retransmits the RS up to report_rtx_limit times, after which it cancels
+/// the session with CancelReceiver { reason: CancelReason::Rlexc }.
+#[test]
+fn test_s32_receiver_report_retry_limit_exceeded_triggers_cr_rlexc() {
+    let rtt = 100_000u64;
+    let margin = 20_000u64;
+    let timeout = rtt + margin; // 120_000 µs
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        report_rtx_limit: 3,
+        rtt_micros: rtt,
+        ack_margin_micros: margin,
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 101,
+    };
+    let mut now = 1_000_000u64;
+
+    let cp = hardy_ltp::segment::Checkpoint {
+        serial: NonZeroU64::new(1).unwrap(),
+        report_serial: 0,
+    };
+    let seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp),
+            data: &[0xBB; 200],
+        }),
+    };
+
+    receiver
+        .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), now)
+        .unwrap();
+
+    // Initial RS #1 is queued, and data is delivered
+    assert!(matches!(
+        receiver.poll_notice(),
+        Some(Notice::RedPartReceived { .. })
+    ));
+    let (_, raw_rs1) = receiver.poll_output().expect("initial RS");
+    let (decoded_rs1, _) = hardy_ltp::segment::Segment::parse(&raw_rs1).unwrap();
+    let rs_serial = match decoded_rs1.body {
+        hardy_ltp::segment::SegmentBody::Report(rs) => rs.report_serial,
+        _ => panic!("expected Report body"),
+    };
+
+    // 3 retransmission attempts
+    for retry_idx in 1..=3 {
+        now += timeout;
+        receiver.handle_timer_tick(now);
+        let (_, rtx_bytes) = receiver
+            .poll_output()
+            .unwrap_or_else(|| panic!("retry {retry_idx} expected"));
+        let (decoded_rtx, _) = hardy_ltp::segment::Segment::parse(&rtx_bytes).unwrap();
+        match decoded_rtx.body {
+            hardy_ltp::segment::SegmentBody::Report(rs) => {
+                assert_eq!(rs.report_serial, rs_serial);
+            }
+            _ => panic!("expected Report body on retry"),
+        }
+    }
+
+    // 4th timeout: report_rtx_limit (3) is exceeded! Receiver initiates cancellation
+    now += timeout;
+    receiver.handle_timer_tick(now);
+
+    assert_eq!(
+        receiver.poll_notice(),
+        Some(Notice::TransmissionSessionCancelled {
+            session: session_id,
+            reason: CancelReason::Rlexc,
+        })
+    );
+
+    let (_, cancel_bytes) = receiver.poll_output().expect("outbound CR expected");
+    let (decoded_cr, _) = hardy_ltp::segment::Segment::parse(&cancel_bytes).unwrap();
+    assert_eq!(
+        decoded_cr.body,
+        hardy_ltp::segment::SegmentBody::CancelReceiver {
+            reason: CancelReason::Rlexc
+        }
+    );
+}
+
+/// Scenario S33: Final ReportAck lost; sender in CLOSED state retransmits RA (RFC 5326 §6.13 & §8.1).
+///
+/// When the sender successfully completes a transmission session and purges its state,
+/// but its final ReportAck (RA) segment is lost in transit, any subsequent RS retransmitted
+/// by the receiver must elicit an RA from the sender (even though the session is in CLOSED state),
+/// allowing the receiver to cleanly complete its session.
+#[test]
+fn test_s33_report_ack_lost_sender_closed_retransmits_ra() {
+    let rtt = 100_000u64;
+    let margin = 20_000u64;
+    let timeout = rtt + margin;
+    let cfg_tx = EngineConfig {
+        engine_id: EngineId(1),
+        rtt_micros: rtt,
+        ack_margin_micros: margin,
+        ..Default::default()
+    };
+    let cfg_rx = EngineConfig {
+        engine_id: EngineId(2),
+        rtt_micros: rtt,
+        ack_margin_micros: margin,
+        ..Default::default()
+    };
+
+    let mut sender = Engine::new(cfg_tx);
+    let mut receiver = Engine::new(cfg_rx);
+    let mut now = 1_000_000u64;
+
+    let payload = Bytes::from_static(b"RFC 5326 Section 8.1 closed state test");
+    let payload_len = payload.len() as u64;
+    let session_id = sender
+        .request_transmission(EngineId(2), 1, payload, payload_len, now)
+        .unwrap();
+    assert_eq!(sender.active_send_sessions(), 1);
+
+    // Sender emits data segment
+    let (_, tx_data) = sender.poll_output().unwrap();
+    receiver
+        .handle_incoming_segment(EngineId(1), &tx_data, now)
+        .unwrap();
+    assert!(matches!(
+        receiver.poll_notice(),
+        Some(Notice::RedPartReceived { .. })
+    ));
+
+    // Receiver emits Report Segment (RS)
+    let (_, rs_bytes) = receiver.poll_output().unwrap();
+
+    // Sender receives RS: marks session complete and removes send session from memory
+    sender
+        .handle_incoming_segment(EngineId(2), &rs_bytes, now)
+        .unwrap();
+    assert_eq!(
+        sender.poll_notice(),
+        Some(Notice::TransmissionSessionCompleted {
+            session: session_id
+        })
+    );
+    assert_eq!(sender.active_send_sessions(), 0);
+
+    // Sender produces ReportAck #1, but it gets lost on the wire
+    let (_, _lost_ra) = sender.poll_output().unwrap();
+
+    // Receiver timer expires: receiver retransmits the RS
+    now += timeout;
+    receiver.handle_timer_tick(now);
+    let (_, rtx_rs) = receiver.poll_output().unwrap();
+
+    // Sender receives retransmitted RS while session is already CLOSED: MUST still emit RA
+    sender
+        .handle_incoming_segment(EngineId(2), &rtx_rs, now)
+        .unwrap();
+    let (_, ra2_bytes) = sender
+        .poll_output()
+        .expect("sender in CLOSED state must emit RA");
+    let (decoded_ra2, _) = hardy_ltp::segment::Segment::parse(&ra2_bytes).unwrap();
+    assert!(matches!(
+        decoded_ra2.body,
+        hardy_ltp::segment::SegmentBody::ReportAck { .. }
+    ));
+
+    // Receiver receives RA #2 and cleanly closes receive session
+    receiver
+        .handle_incoming_segment(EngineId(1), &ra2_bytes, now)
+        .unwrap();
+    assert_eq!(receiver.active_recv_sessions(), 0);
+}
+
+/// Scenario S34: Deferred EORP handling when EORP segment arrives before segment 0 (RFC 5326 §6.9 & §8.2).
+///
+/// In case of link reordering where segment 2 (with RedCpEorpEob) arrives BEFORE segment 1 (offset 0),
+/// the receiver records EORP and answers the checkpoint with a partial report, but does NOT deliver
+/// the red part. Once segment 1 arrives (even without a CP flag), the red part becomes contiguous
+/// and RedPartReceived is delivered immediately.
+#[test]
+fn test_s34_out_of_order_eorp_arrives_before_segment_zero() {
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 104,
+    };
+    let now = 1_000_000u64;
+
+    // Segment 2: offset 1000..2000 with EORP + EOB and Checkpoint
+    let cp = hardy_ltp::segment::Checkpoint {
+        serial: NonZeroU64::new(1).unwrap(),
+        report_serial: 0,
+    };
+    let seg2 = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 1000,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp),
+            data: &[0x22; 1000],
+        }),
+    };
+
+    // Segment 1: offset 0..1000 plain Red (no CP, no EORP)
+    let seg1 = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::Red,
+            data: &[0x11; 1000],
+        }),
+    };
+
+    // 1. Deliver Segment 2 first (reordered)
+    receiver
+        .handle_incoming_segment(EngineId(1), &seg2.encode_to_vec(), now)
+        .unwrap();
+
+    // Checkpoint is answered with an RS claiming 1000..2000
+    let (_, raw_rs) = receiver.poll_output().expect("RS expected for CP");
+    let (decoded_rs, _) = hardy_ltp::segment::Segment::parse(&raw_rs).unwrap();
+    match decoded_rs.body {
+        hardy_ltp::segment::SegmentBody::Report(rs) => {
+            assert_eq!(rs.claims.len(), 1);
+            assert_eq!(rs.claims[0].offset, 1000);
+            assert_eq!(rs.claims[0].length, 1000);
+        }
+        _ => panic!("expected Report"),
+    }
+    // Red part is NOT complete yet: no notice emitted
+    assert_eq!(receiver.poll_notice(), None);
+
+    // 2. Deliver delayed Segment 1 (offset 0..1000, no CP)
+    receiver
+        .handle_incoming_segment(EngineId(1), &seg1.encode_to_vec(), now + 10_000)
+        .unwrap();
+
+    // Red part is now 100% complete and contiguous: RedPartReceived MUST be delivered immediately!
+    match receiver.poll_notice() {
+        Some(Notice::RedPartReceived {
+            session,
+            client_service,
+            data,
+            eob,
+            ..
+        }) => {
+            assert_eq!(session, session_id);
+            assert_eq!(client_service, 1);
+            assert_eq!(data.len(), 2000);
+            assert_eq!(&data[..1000], &[0x11; 1000]);
+            assert_eq!(&data[1000..], &[0x22; 1000]);
+            assert!(eob);
+        }
+        other => panic!("expected RedPartReceived, got {other:?}"),
+    }
+}
+
+/// Scenario S35: Redundant checkpoint reception does not reset Report retry count (RFC 5326 §6.8 (b)).
+///
+/// When an RS timer has already ticked and incremented retries, the arrival of a redundantly
+/// retransmitted CP triggers RS retransmission without resetting the RS retries counter to 0.
+#[test]
+fn test_s35_duplicate_checkpoint_does_not_reset_report_retries() {
+    let rtt = 100_000u64;
+    let margin = 20_000u64;
+    let timeout = rtt + margin; // 120_000 µs
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        report_rtx_limit: 3,
+        rtt_micros: rtt,
+        ack_margin_micros: margin,
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 105,
+    };
+    let mut now = 1_000_000u64;
+
+    let cp = hardy_ltp::segment::Checkpoint {
+        serial: NonZeroU64::new(1).unwrap(),
+        report_serial: 0,
+    };
+    let cp_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp),
+            data: &[0x33; 100],
+        }),
+    };
+    let cp_bytes = cp_seg.encode_to_vec();
+
+    // 1. Initial CP arrival -> RS #1 emitted (retries = 0)
+    receiver
+        .handle_incoming_segment(EngineId(1), &cp_bytes, now)
+        .unwrap();
+    let _ = receiver.poll_notice(); // Drain RedPartReceived
+    let _ = receiver.poll_output(); // Drain initial RS
+
+    // 2. RS timer ticks twice -> retries = 2
+    now += timeout;
+    receiver.handle_timer_tick(now);
+    let _ = receiver.poll_output(); // Retransmit 1
+    now += timeout;
+    receiver.handle_timer_tick(now);
+    let _ = receiver.poll_output(); // Retransmit 2
+
+    // 3. Sender's CP timer expired: sender retransmits the same CP
+    // Receiver MUST re-emit the RS, but NOT reset retries to 0!
+    receiver
+        .handle_incoming_segment(EngineId(1), &cp_bytes, now)
+        .unwrap();
+    let (_, rtx_by_cp) = receiver
+        .poll_output()
+        .expect("RS re-emitted on duplicate CP");
+    let (decoded, _) = hardy_ltp::segment::Segment::parse(&rtx_by_cp).unwrap();
+    assert!(matches!(
+        decoded.body,
+        hardy_ltp::segment::SegmentBody::Report(..)
+    ));
+
+    // 4. RS timer ticks once more -> retries reaches 3 (equal to report_rtx_limit)
+    now += timeout;
+    receiver.handle_timer_tick(now);
+    let _ = receiver.poll_output(); // Retransmit 3
+
+    // 5. Next tick: retries > 3 -> session MUST cancel with CR(RLEXC)
+    now += timeout;
+    receiver.handle_timer_tick(now);
+
+    assert_eq!(
+        receiver.poll_notice(),
+        Some(Notice::TransmissionSessionCancelled {
+            session: session_id,
+            reason: CancelReason::Rlexc,
+        })
+    );
+    let (_, cancel_bytes) = receiver.poll_output().expect("CR expected");
+    let (decoded_cr, _) = hardy_ltp::segment::Segment::parse(&cancel_bytes).unwrap();
+    assert_eq!(
+        decoded_cr.body,
+        hardy_ltp::segment::SegmentBody::CancelReceiver {
+            reason: CancelReason::Rlexc
+        }
+    );
+}
+
+/// Scenario S36: Session problem limit exceeded cancels with CR(RLEXC) (RFC 5326 §6.11).
+///
+/// When an excessive number of distinct unacknowledged checkpoints arrive exceeding
+/// max_reports_per_session, the receiver cancels the session with CR(RLEXC).
+#[test]
+fn test_s36_max_reports_per_session_exceeded_cancels_with_rlexc() {
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        max_reports_per_session: 3,
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 106,
+    };
+    let now = 1_000_000u64;
+
+    // Send 3 distinct checkpoints (cp_serial 1, 2, 3) filling max_reports_per_session capacity
+    for cp_num in 1..=3 {
+        let cp = hardy_ltp::segment::Checkpoint {
+            serial: NonZeroU64::new(cp_num).unwrap(),
+            report_serial: 0,
+        };
+        let seg = hardy_ltp::segment::Segment {
+            session: session_id,
+            header_ext: Vec::new(),
+            trailer_ext: Vec::new(),
+            body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+                client_service: 1,
+                offset: (cp_num - 1) * 100,
+                kind: hardy_ltp::segment::DataSegKind::RedCp(cp),
+                data: &[0x44; 100],
+            }),
+        };
+        receiver
+            .handle_incoming_segment(EngineId(1), &seg.encode_to_vec(), now)
+            .unwrap();
+        let _ = receiver.poll_output(); // Drain issued RS
+    }
+
+    assert_eq!(receiver.active_recv_sessions(), 1);
+
+    // Send a 4th checkpoint exceeding max_reports_per_session (3)
+    let cp4 = hardy_ltp::segment::Checkpoint {
+        serial: NonZeroU64::new(4).unwrap(),
+        report_serial: 0,
+    };
+    let seg4 = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 300,
+            kind: hardy_ltp::segment::DataSegKind::RedCpEorpEob(cp4),
+            data: &[0x44; 100],
+        }),
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &seg4.encode_to_vec(), now)
+        .unwrap();
+
+    // Receiver must cancel the session with RLEXC
+    assert_eq!(
+        receiver.poll_notice(),
+        Some(Notice::TransmissionSessionCancelled {
+            session: session_id,
+            reason: CancelReason::Rlexc,
+        })
+    );
+    let (_, cancel_bytes) = receiver.poll_output().expect("CR expected");
+    let (decoded_cr, _) = hardy_ltp::segment::Segment::parse(&cancel_bytes).unwrap();
+    assert_eq!(
+        decoded_cr.body,
+        hardy_ltp::segment::SegmentBody::CancelReceiver {
+            reason: CancelReason::Rlexc
+        }
+    );
+
+    // Peer sends CAR acknowledging cancellation
+    let car_seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::CancelAckReceiver,
+    };
+    receiver
+        .handle_incoming_segment(EngineId(1), &car_seg.encode_to_vec(), now)
+        .unwrap();
+
+    assert_eq!(receiver.active_recv_sessions(), 0);
+}
+
+/// Scenario S38: Datagram with trailing unparsed bytes rejected (RFC 7122 §3.3).
+///
+/// RFC 7122 §3.3 dictates that every datagram MUST contain exactly one LTP segment.
+/// If trailing unparsed bytes follow a valid segment, handle_incoming_segment must
+/// return Error::TrailingBytes.
+#[test]
+fn test_s38_trailing_bytes_rejected() {
+    let cfg = EngineConfig {
+        engine_id: EngineId(2),
+        ..Default::default()
+    };
+    let mut receiver = Engine::new(cfg);
+
+    let session_id = SessionId {
+        originator: EngineId(1),
+        number: 108,
+    };
+    let now = 1_000_000u64;
+
+    let seg = hardy_ltp::segment::Segment {
+        session: session_id,
+        header_ext: Vec::new(),
+        trailer_ext: Vec::new(),
+        body: hardy_ltp::segment::SegmentBody::Data(hardy_ltp::segment::DataSegment {
+            client_service: 1,
+            offset: 0,
+            kind: hardy_ltp::segment::DataSegKind::Green,
+            data: &[0x55; 50],
+        }),
+    };
+    let mut bytes = seg.encode_to_vec();
+    bytes.extend_from_slice(b"EXTRA_TRAILING_BYTES");
+
+    let res = receiver.handle_incoming_segment(EngineId(1), &bytes, now);
+    assert!(matches!(
+        res,
+        Err(hardy_ltp::engine::Error::TrailingBytes { consumed, total })
+            if consumed < total && total == bytes.len()
     ));
 }

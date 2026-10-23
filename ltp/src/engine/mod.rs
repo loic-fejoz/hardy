@@ -35,6 +35,10 @@ pub enum Error {
     /// A transmission request exceeded the maximum configured block size.
     #[error("block length {block_len} exceeds maximum configured size {max_block_size}")]
     BlockTooLarge { block_len: u64, max_block_size: u64 },
+
+    /// Segment has trailing unparsed bytes violating the one-segment-per-datagram rule (RFC 7122 §3.3).
+    #[error("trailing bytes in segment: consumed {consumed} of {total}")]
+    TrailingBytes { consumed: usize, total: usize },
 }
 
 /// Specialized Result for engine operations.
@@ -137,6 +141,18 @@ impl Engine {
     #[must_use]
     pub fn engine_id(&self) -> EngineId {
         self.config.engine_id
+    }
+
+    /// Returns the number of active send sessions.
+    #[must_use]
+    pub fn active_send_sessions(&self) -> usize {
+        self.send_sessions.len()
+    }
+
+    /// Returns the number of active receive sessions.
+    #[must_use]
+    pub fn active_recv_sessions(&self) -> usize {
+        self.recv_sessions.len()
     }
 
     /// Requests transmission of a client service data block (RFC 5326 §4.1).
@@ -315,7 +331,13 @@ impl Engine {
         segment_bytes: &[u8],
         now: u64,
     ) -> Result<()> {
-        let (segment, _) = Segment::parse(segment_bytes)?;
+        let (segment, consumed) = Segment::parse(segment_bytes)?;
+        if consumed != segment_bytes.len() {
+            return Err(Error::TrailingBytes {
+                consumed,
+                total: segment_bytes.len(),
+            });
+        }
 
         // Resolve effective peer engine ID from session context if available,
         // supporting dynamic/ephemeral transport ports from known peers.
@@ -440,6 +462,14 @@ impl Engine {
             );
         }
 
+        // RFC 5326 §6.2: Validate client service identifier
+        if let Some(allowed) = &self.config.allowed_client_services
+            && !allowed.contains(&ds.client_service)
+        {
+            self.initiate_cancel_receiver(session_id, from, CancelReason::Unreach, now);
+            return;
+        }
+
         // RFC 5326 §6.21: Red/green ordering violation checks (Miscolored)
         let seg_end = ds.offset.saturating_add(ds.data.len() as u64);
         if ds.kind.is_red() {
@@ -481,21 +511,43 @@ impl Engine {
                 let cp_serial = cp.serial.get();
                 let upper_bound = ds.offset.saturating_add(ds.data.len() as u64);
 
-                let report_serial =
-                    if let Some(&existing_rs) = session.cp_serials_answered.get(&cp_serial) {
-                        existing_rs
-                    } else {
-                        let serial = next_nonzero_serial(&mut session.last_report_serial).get();
-                        session.cp_serials_answered.insert(cp_serial, serial);
-                        serial
-                    };
+                if let Some(serials) = session.cp_serials_answered.get(&cp_serial).cloned() {
+                    // RFC 5326 §6.8 (b): Redundantly retransmitted checkpoint.
+                    // Re-emit previously issued RS segment(s) without resetting retry counts.
+                    for rs_serial in serials {
+                        if let Some(rec) = session.reports.get(&rs_serial)
+                            && !rec.acked
+                        {
+                            let wire_seg = Segment {
+                                session: session_id,
+                                header_ext: Vec::new(),
+                                trailer_ext: Vec::new(),
+                                body: SegmentBody::Report(rec.report.clone()),
+                            };
+                            self.outbound.push_back((from, wire_seg.encode_to_vec()));
+                            let deadline = now
+                                .saturating_add(self.config.rtt_micros)
+                                .saturating_add(self.config.ack_margin_micros);
+                            self.timer_table
+                                .set(TimerKey::report(session_id, rs_serial), deadline);
+                        }
+                    }
+                } else {
+                    // Fresh checkpoint
+                    if session.reports.len() >= self.config.max_reports_per_session {
+                        // RFC 5326 §6.11: Session problem limit exceeded
+                        self.initiate_cancel_receiver(session_id, from, CancelReason::Rlexc, now);
+                        return;
+                    }
 
-                let all_runs: Vec<_> = session.red_received.runs_within(0..upper_bound).collect();
-                let max_claims = self.config.max_claims_per_report.max(1);
+                    let all_runs: Vec<_> =
+                        session.red_received.runs_within(0..upper_bound).collect();
+                    let max_claims = self.config.max_claims_per_report.max(1);
 
-                if all_runs.is_empty() {
-                    // Valid report with 0 claims (RFC 5326 §3.2.2)
-                    if session.reports.len() < self.config.max_reports_per_session {
+                    if all_runs.is_empty() {
+                        // Valid report with 0 claims (RFC 5326 §3.2.2)
+                        let report_serial =
+                            next_nonzero_serial(&mut session.last_report_serial).get();
                         let report_seg = ReportSegment {
                             report_serial: NonZeroU64::new(report_serial).expect("non zero"),
                             checkpoint_serial: cp_serial,
@@ -519,44 +571,55 @@ impl Engine {
                             acked: false,
                         };
                         session.reports.insert(report_serial, record);
+                        session
+                            .cp_serials_answered
+                            .insert(cp_serial, alloc::vec![report_serial]);
 
                         let deadline = now
                             .saturating_add(self.config.rtt_micros)
                             .saturating_add(self.config.ack_margin_micros);
                         self.timer_table
                             .set(TimerKey::report(session_id, report_serial), deadline);
-                    }
-                } else {
-                    let chunks: Vec<_> = all_runs.chunks(max_claims).collect();
-                    let num_chunks = chunks.len();
+                    } else {
+                        let chunks: Vec<_> = all_runs.chunks(max_claims).collect();
+                        let num_chunks = chunks.len();
+                        let mut rs_serials = Vec::with_capacity(num_chunks);
 
-                    for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-                        let rs_serial = if chunk_idx == 0 {
-                            report_serial
-                        } else {
-                            next_nonzero_serial(&mut session.last_report_serial).get()
-                        };
+                        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                            if session.reports.len() >= self.config.max_reports_per_session {
+                                // RFC 5326 §6.11: Limit exceeded during report segmentation
+                                self.initiate_cancel_receiver(
+                                    session_id,
+                                    from,
+                                    CancelReason::Rlexc,
+                                    now,
+                                );
+                                return;
+                            }
 
-                        let lower_bound = if chunk_idx == 0 {
-                            0
-                        } else {
-                            chunk.first().expect("non-empty").start
-                        };
-                        let chunk_upper = if chunk_idx + 1 == num_chunks {
-                            upper_bound
-                        } else {
-                            chunk.last().expect("non-empty").end
-                        };
+                            let rs_serial =
+                                next_nonzero_serial(&mut session.last_report_serial).get();
+                            rs_serials.push(rs_serial);
 
-                        let claims: Vec<_> = chunk
-                            .iter()
-                            .map(|r| ReceptionClaim {
-                                offset: r.start.saturating_sub(lower_bound),
-                                length: r.end.saturating_sub(r.start),
-                            })
-                            .collect();
+                            let lower_bound = if chunk_idx == 0 {
+                                0
+                            } else {
+                                chunk.first().expect("non-empty").start
+                            };
+                            let chunk_upper = if chunk_idx + 1 == num_chunks {
+                                upper_bound
+                            } else {
+                                chunk.last().expect("non-empty").end
+                            };
 
-                        if session.reports.len() < self.config.max_reports_per_session {
+                            let claims: Vec<_> = chunk
+                                .iter()
+                                .map(|r| ReceptionClaim {
+                                    offset: r.start.saturating_sub(lower_bound),
+                                    length: r.end.saturating_sub(r.start),
+                                })
+                                .collect();
+
                             let report_seg = ReportSegment {
                                 report_serial: NonZeroU64::new(rs_serial).expect("non zero"),
                                 checkpoint_serial: cp_serial,
@@ -587,6 +650,7 @@ impl Engine {
                             self.timer_table
                                 .set(TimerKey::report(session_id, rs_serial), deadline);
                         }
+                        session.cp_serials_answered.insert(cp_serial, rs_serials);
                     }
                 }
             }

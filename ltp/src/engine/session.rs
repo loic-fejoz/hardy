@@ -130,8 +130,8 @@ pub struct RecvSession {
     pub last_report_serial: u64,
     /// Issued reports keyed by report serial number.
     pub reports: BTreeMap<u64, ReportRecord>,
-    /// Checkpoint serials answered -> report serial issued.
-    pub cp_serials_answered: BTreeMap<u64, u64>,
+    /// Checkpoint serials answered -> report serials issued.
+    pub cp_serials_answered: BTreeMap<u64, Vec<u64>>,
     /// Union of claims acknowledged by RA.
     pub reported_coverage: RangeSet,
     /// True once the complete red part has been delivered as a notice.
