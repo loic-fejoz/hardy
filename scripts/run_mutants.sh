@@ -30,7 +30,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --diff)
-            EXTRA_ARGS+=("--in-diff" "HEAD~1")
+            DIFF_FILE="$(mktemp)"
+            git diff "${2:-HEAD~1}" > "$DIFF_FILE"
+            EXTRA_ARGS+=("--in-diff" "$DIFF_FILE")
             shift
             ;;
         --file)

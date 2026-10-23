@@ -58,7 +58,8 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           git fetch origin ${{ github.base_ref }}
-          cargo mutants -p hardy-ltp -p hardy-ltp-cla --in-diff origin/${{ github.base_ref }}
+          git diff "origin/${{ github.base_ref }}...HEAD" > /tmp/pr.diff
+          cargo mutants -p hardy-ltp -p hardy-ltp-cla --in-diff /tmp/pr.diff
 
       - name: Run mutation testing (Full scheduled / manual)
         if: github.event_name != 'pull_request'
