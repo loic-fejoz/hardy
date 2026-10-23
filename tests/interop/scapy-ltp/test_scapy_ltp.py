@@ -372,6 +372,204 @@ class TestScapyLtp(unittest.TestCase):
         extracted = extract_bpv7_payload(echoed_payload)
         self.assertEqual(extracted, echo_message, f"Echoed payload mismatch: {extracted} vs {echo_message}")
 
+    def test_11_interleaved_concurrent_green_and_red_sessions(self):
+        """Test 11: Interleaved concurrent Red and Green sessions multiplexed on same UDP stream."""
+        red_session_no = 201
+        green_session_a = 202
+        green_session_b = 203
+        green_session_c = 204
+
+        red_part1 = b"CONCURRENT_RED_CHUNK_1_"
+        red_part2 = b"CONCURRENT_RED_CHUNK_2_CP"
+        total_red_len = len(red_part1) + len(red_part2)
+
+        # 1. Send initial Red data without checkpoint (session 201)
+        seg_red_1 = self.peer.make_red_data(
+            session_no=red_session_no,
+            payload=red_part1,
+            offset=0,
+            is_checkpoint=False,
+            is_eorp=False,
+            is_eob=False,
+        )
+        self.peer.send_segment(seg_red_1)
+
+        # 2. Interleave Green datagrams (sessions 202 and 203)
+        seg_green_a = self.peer.make_green_data(
+            session_no=green_session_a,
+            payload=b"GREEN_INTERLEAVED_DATAGRAM_A",
+            is_eob=True,
+        )
+        self.peer.send_segment(seg_green_a)
+
+        seg_green_b = self.peer.make_green_data(
+            session_no=green_session_b,
+            payload=b"GREEN_INTERLEAVED_DATAGRAM_B",
+            is_eob=True,
+        )
+        self.peer.send_segment(seg_green_b)
+
+        # 3. Send Red checkpoint (session 201)
+        seg_red_2 = self.peer.make_red_data(
+            session_no=red_session_no,
+            payload=red_part2,
+            offset=len(red_part1),
+            is_checkpoint=True,
+            is_eorp=True,
+            is_eob=True,
+            checkpoint_serial=1,
+        )
+        self.peer.send_segment(seg_red_2)
+
+        # 4. Interleave another Green datagram (session 204)
+        seg_green_c = self.peer.make_green_data(
+            session_no=green_session_c,
+            payload=b"GREEN_INTERLEAVED_DATAGRAM_C",
+            is_eob=True,
+        )
+        self.peer.send_segment(seg_green_c)
+
+        # 5. Hardy must emit RS ONLY for the Red session 201
+        rs = self.peer.recv_segment(timeout=2.0)
+        self.assertIsNotNone(rs, "Hardy should issue RS for the Red session")
+        self.assertEqual(rs.flags, 8, "Expected Report Segment (flags 8)")
+        self.assertEqual(rs.SessionNumber, red_session_no, "RS must match Red session number")
+        self.assertEqual(rs.ReportUpperBound, total_red_len)
+
+        # 6. Acknowledge Red RS with RA
+        ra = self.peer.make_report_ack(session_no=red_session_no, report_serial=rs.ReportSerialNo)
+        self.peer.send_segment(ra)
+
+        # 7. Verify no unexpected segments (no RS should ever be generated for Green sessions)
+        trailing = self.peer.recv_segment(timeout=0.3)
+        self.assertIsNone(trailing, "Green sessions must remain completely silent without RS")
+
+    def test_12_green_ingress_triggers_red_egress_echo(self):
+        """Test 12: Ingress bundle in Green data triggers an egress echo response in Red data."""
+        session_no = 212
+        echo_message = b"ECHO_BUNDLE_SENT_AS_GREEN_DATA"
+        bundle_bytes = make_bpv7_bundle(
+            src_node=LOCAL_ENGINE,
+            src_service=7,
+            dest_node=REMOTE_ENGINE,
+            dest_service=7,
+            payload=echo_message,
+        )
+
+        # 1. Scapy sends BPv7 bundle to Hardy entirely as Green data (unreliable datagram)
+        seg = self.peer.make_green_data(
+            session_no=session_no,
+            payload=bundle_bytes,
+            offset=0,
+            client_service=1,  # Bundle Protocol client service
+            is_eob=True,
+        )
+        self.peer.send_segment(seg)
+
+        # 2. Verify Hardy generates NO Report Segment for ingress Green data
+        spurious_rs = self.peer.recv_segment(timeout=0.2)
+        if spurious_rs is not None and spurious_rs.flags == 8:
+            self.fail("Hardy must never emit RS for Green ingress data")
+
+        # 3. Hardy BPA delivers to Echo service, which routes echo bundle back to ipn:2.7
+        #    Hardy LTP CLA transmits this egress bundle as Red data (default lane)
+        echo_seg = spurious_rs if (spurious_rs is not None and spurious_rs.SessionOriginator == REMOTE_ENGINE) else self.peer.recv_segment(timeout=3.0)
+        self.assertIsNotNone(echo_seg, "Hardy should transmit echoed bundle back to Scapy")
+        self.assertEqual(echo_seg.SessionOriginator, REMOTE_ENGINE)
+        self.assertIn(echo_seg.flags, [1, 2, 3], "Hardy egress echo should arrive as Red data checkpoint")
+
+        # 4. Acknowledge Hardy's Red session with RS
+        hardy_session_no = echo_seg.SessionNumber
+        hardy_cp_serial = echo_seg.CheckpointSerialNo
+        echoed_payload = echo_seg.LTP_Payload[0].load
+
+        rs_to_hardy = LTP(
+            version=0,
+            flags=8,
+            SessionOriginator=REMOTE_ENGINE,
+            SessionNumber=hardy_session_no,
+            HeaderExtensionCount=0,
+            TrailerExtensionCount=0,
+            ReportSerialNo=1,
+            ReportCheckpointSerialNo=hardy_cp_serial,
+            ReportUpperBound=len(echoed_payload),
+            ReportLowerBound=0,
+            ReportReceptionClaimCount=1,
+            ReportReceptionClaims=[
+                LTPReceptionClaim(ReceptionClaimOffset=0, ReceptionClaimLength=len(echoed_payload))
+            ],
+        )
+        self.peer.send_segment(rs_to_hardy)
+
+        # 5. Hardy sends RA acknowledging Scapy's RS
+        ra = self.peer.recv_segment(timeout=2.0)
+        self.assertIsNotNone(ra, "Hardy should send RA acknowledging Scapy's RS")
+        self.assertEqual(ra.flags, 9, "Expected RA (flag 0x9)")
+
+        # 6. Verify that bundle payload survived the Green ingress -> Red egress round-trip
+        extracted = extract_bpv7_payload(echoed_payload)
+        self.assertEqual(extracted, echo_message, f"Payload mismatch: {extracted} vs {echo_message}")
+
+    def test_13_multi_segment_green_interleaved_with_retransmitted_red(self):
+        """Test 13: Multi-segment Green transfer interleaved during Red checkpoint retransmissions."""
+        red_session_no = 230
+        green_session_no = 231
+
+        red_payload = b"RED_CHECKPOINT_RETRANSMITTED_DATA"
+        green_part1 = b"GREEN_SEGMENT_1_HEADER_"
+        green_part2 = b"GREEN_SEGMENT_2_BODY_TAIL"
+
+        # 1. Send Red checkpoint
+        red_seg = self.peer.make_red_data(
+            session_no=red_session_no,
+            payload=red_payload,
+            offset=0,
+            is_checkpoint=True,
+            is_eorp=True,
+            is_eob=True,
+            checkpoint_serial=1,
+        )
+        self.peer.send_segment(red_seg)
+
+        # 2. Hardy replies with RS #1
+        rs1 = self.peer.recv_segment(timeout=2.0)
+        self.assertIsNotNone(rs1)
+        self.assertEqual(rs1.flags, 8)
+        self.assertEqual(rs1.SessionNumber, red_session_no)
+
+        # 3. Scapy does NOT send RA yet. Instead, Scapy sends a 2-segment Green transfer
+        g_seg1 = self.peer.make_green_data(
+            session_no=green_session_no,
+            payload=green_part1,
+            offset=0,
+            is_eob=False,
+        )
+        self.peer.send_segment(g_seg1)
+
+        g_seg2 = self.peer.make_green_data(
+            session_no=green_session_no,
+            payload=green_part2,
+            offset=len(green_part1),
+            is_eob=True,
+        )
+        self.peer.send_segment(g_seg2)
+
+        # 4. Scapy retransmits the Red checkpoint (simulating loss of RS1 or CP retry)
+        self.peer.send_segment(red_seg)
+
+        # 5. Hardy must reply with preserved RS
+        rs2 = self.peer.recv_segment(timeout=2.0)
+        self.assertIsNotNone(rs2, "Hardy must reply to redundant CP during interleaved Green traffic")
+        self.assertEqual(rs2.ReportSerialNo, rs1.ReportSerialNo)
+
+        # 6. Complete Red session with RA
+        ra = self.peer.make_report_ack(session_no=red_session_no, report_serial=rs2.ReportSerialNo)
+        self.peer.send_segment(ra)
+
+        # 7. Drain and ensure clean completion
+        drain = self.peer.recv_segment(timeout=0.3)
+        self.assertIsNone(drain, "All interleaved sessions completed cleanly")
+
 
 if __name__ == "__main__":
     unittest.main()
