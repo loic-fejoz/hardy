@@ -1,0 +1,10 @@
+# cargo-audit configuration
+# https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0387: Multiple timing variability issues in crypto-bigint v0.5.5.
+    # Transitive dependency from official AWS SDK (hardy-s3-storage -> aws-config -> aws-sigv4 -> p256 -> elliptic-curve).
+    # Requires AWS SDK upstream to migrate to crypto-bigint >= 0.7.6 / elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
+]
