@@ -9,7 +9,7 @@ repository.workspace = true
 publish = false
 
 [features]
-default = ["sqlite-storage", "localdisk-storage", "grpc", "tcpclv4", "ltp-cla", "otel", "echo"]
+default = ["sqlite-storage", "localdisk-storage", "grpc", "tcpclv4", "ltp-cla", "hqfbp-cla", "otel", "echo"]
 otel = ["dep:hardy-otel"]
 sqlite-storage = ["dep:hardy-sqlite-storage"]
 postgres-storage = ["dep:hardy-postgres-storage", "dep:humantime"]
@@ -19,6 +19,7 @@ grpc = ["dep:hardy-proto"]
 tcpclv4 = ["dep:hardy-tcpclv4"]
 file-cla = ["dep:hardy-file-cla"]
 ltp-cla = ["dep:hardy-ltp-cla"]
+hqfbp-cla = ["dep:hardy-hqfbp-cla"]
 echo = ["dep:hardy-echo-service"]
 instrument = [
     "tracing/attributes",
@@ -32,6 +33,7 @@ instrument = [
     "hardy-tcpclv4?/instrument",
     "hardy-file-cla?/instrument",
     "hardy-ltp-cla?/instrument",
+    "hardy-hqfbp-cla?/instrument",
     "hardy-echo-service?/instrument",
 ]
 
@@ -48,6 +50,7 @@ hardy-s3-storage = { version = "0.2", path = "../s3-storage", features = ["serde
 hardy-tcpclv4 = { version = "0.4", path = "../tcpclv4", features = ["serde"], optional = true }
 hardy-file-cla = { version = "0.2", path = "../file-cla", features = ["serde"], optional = true }
 hardy-ltp-cla = { version = "0.1", path = "../ltp-cla", features = ["serde"], optional = true }
+hardy-hqfbp-cla = { version = "0.1", path = "../hqfbp-cla", features = ["serde"], optional = true }
 hardy-otel = { version = "0.2", path = "../otel", optional = true }
 hardy-echo-service = { version = "0.2", path = "../echo-service", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "fs"] }

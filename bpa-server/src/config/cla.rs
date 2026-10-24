@@ -36,6 +36,10 @@ pub enum ClaType {
     #[serde(rename = "ltp")]
     Ltp(hardy_ltp_cla::Config),
 
+    #[cfg(feature = "hqfbp-cla")]
+    #[serde(rename = "hqfbp")]
+    Hqfbp(hardy_hqfbp_cla::Config),
+
     #[serde(untagged)]
     Other {
         #[serde(rename = "type")]
@@ -75,6 +79,10 @@ impl<'de> Deserialize<'de> for ClaType {
             #[cfg(feature = "ltp-cla")]
             "ltp" => serde_json::from_value(config)
                 .map(Self::Ltp)
+                .map_err(serde::de::Error::custom),
+            #[cfg(feature = "hqfbp-cla")]
+            "hqfbp" => serde_json::from_value(config)
+                .map(Self::Hqfbp)
                 .map_err(serde::de::Error::custom),
             _ => Ok(Self::Other { cla_type, config }),
         }

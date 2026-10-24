@@ -35,6 +35,8 @@ members = [
     "ltp/fuzz",
     "ltp-cla",
     "ltp-cla/fuzz",
+    "hqfbp-cla",
+    "hqfbp-cla/fuzz",
     "tests/bpsec",
     "tests/storage",
     "postgres-storage",

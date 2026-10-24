@@ -21,6 +21,8 @@ use hardy_bpa::{
 use hardy_echo_service::EchoService;
 #[cfg(feature = "file-cla")]
 use hardy_file_cla::Cla as FileCla;
+#[cfg(feature = "hqfbp-cla")]
+use hardy_hqfbp_cla::HqfbpCla;
 #[cfg(feature = "localdisk-storage")]
 use hardy_localdisk_storage::LocalDiskStorage;
 #[cfg(feature = "ltp-cla")]
@@ -347,6 +349,12 @@ impl BpaServer {
                     Arc::new(LtpCla::new(ltp_config.clone())) as Arc<dyn Cla>,
                     ClaInit::default(),
                 )),
+                #[cfg(feature = "hqfbp-cla")]
+                ClaType::Hqfbp(hqfbp_config) => {
+                    let cla = HqfbpCla::new(hqfbp_config.clone());
+                    let init = cla.cla_init();
+                    Some((Arc::new(cla) as Arc<dyn Cla>, init))
+                }
                 ClaType::Other { cla_type, .. } => {
                     warn!(
                         "Ignoring CLA '{}' with unknown type '{cla_type}'",
