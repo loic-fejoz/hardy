@@ -3,7 +3,7 @@ use hardy_eid_patterns::EidPattern;
 use super::{Error, Result, RoutingSink};
 use crate::{
     Arc, async_trait,
-    routing::{action::RouteAction, rib::Rib},
+    routing::{TableId, action::RouteAction, rib::Rib},
 };
 
 pub struct Sink {
@@ -37,9 +37,20 @@ impl RoutingSink for Sink {
         action: RouteAction,
         priority: u32,
     ) -> Result<bool> {
+        self.add_route_in_table(TableId::DEFAULT, pattern, action, priority)
+            .await
+    }
+
+    async fn add_route_in_table(
+        &self,
+        table: TableId,
+        pattern: EidPattern,
+        action: RouteAction,
+        priority: u32,
+    ) -> Result<bool> {
         self.check_connected()?;
         self.rib
-            .add(pattern, self.name.clone(), action.into(), priority)
+            .add_in_table(table, pattern, self.name.clone(), action.into(), priority)
             .await
     }
 
@@ -49,10 +60,21 @@ impl RoutingSink for Sink {
         action: &RouteAction,
         priority: u32,
     ) -> Result<bool> {
+        self.remove_route_in_table(TableId::DEFAULT, pattern, action, priority)
+            .await
+    }
+
+    async fn remove_route_in_table(
+        &self,
+        table: TableId,
+        pattern: &EidPattern,
+        action: &RouteAction,
+        priority: u32,
+    ) -> Result<bool> {
         self.check_connected()?;
         Ok(self
             .rib
-            .remove(pattern, &self.name, action.clone().into(), priority)
+            .remove_in_table(table, pattern, &self.name, action.clone().into(), priority)
             .await)
     }
 }

@@ -28,7 +28,7 @@ use hardy_bpa::{
         Boundary, Classifier, ClassifyContext, RewriteContext, Rewriter, Verdict, pack::FilterPack,
         slots::MetadataDelta,
     },
-    routing::{RouteAction, RoutingAgent, RoutingSink},
+    routing::{RouteAction, RoutingAgent, RoutingSink, TableId},
     stream::{Receiver, Segment, buffer_stream},
 };
 use hardy_bpv7::{
@@ -48,11 +48,14 @@ use hardy_eid_patterns::EidPattern;
 /// Code 194 corresponds to the Spray-and-Wait permits block type in ION-DTN.
 const SPRAY_AND_WAIT_BLOCK_TYPE: u64 = 194;
 
+/// Dedicated routing table for Spray-and-Wait opportunistic routing.
+const SPRAY_TABLE: TableId = TableId::new(194);
+
 hardy_bpa::slot!(static SPRAY_L: u32);
 
 /// Ingress classifier that identifies bundles containing the Spray-and-Wait
-/// extension block and records the received $L$ value into the `SPRAY_L` slot
-/// and tracks it in `updated_slots`.
+/// extension block, assigns them to `SPRAY_TABLE`, and records the received $L$
+/// value into the `SPRAY_L` slot and tracks it in `updated_slots`.
 struct SnwIngressClassifier {
     updated_slots: Arc<Mutex<HashMap<BundleId, u32>>>,
 }
@@ -73,6 +76,7 @@ impl Classifier for SnwIngressClassifier {
                 .unwrap()
                 .insert(ctx.bundle().primary.id.clone(), l);
             let mut delta = MetadataDelta::default();
+            delta.route_table = Some(SPRAY_TABLE);
             delta.set(&SPRAY_L, &l);
             return Verdict::Continue(delta);
         }
@@ -142,24 +146,20 @@ impl Rewriter for SnwEgressRewriter {
 
 /// Simulated CLA capturing forwarded bundles into an asynchronous flume channel.
 ///
-/// For opportunistic spray hops (`is_destination == false`), returns
-/// [`ForwardBundleResult::Retained`] so the BPA retains the bundle in storage.
-/// For final destination delivery (`is_destination == true`), returns
-/// [`ForwardBundleResult::Sent`] to finalize and remove the bundle.
+/// Returns [`ForwardBundleResult::Sent`] unconditionally without inspecting
+/// bundle destination or DTN routing headers.
 struct MockCla {
     sink: Once<Box<dyn Sink>>,
     forwarded_tx: FlumeSender<Bytes>,
-    is_destination: bool,
 }
 
 impl MockCla {
-    fn new(is_destination: bool) -> (Arc<Self>, FlumeReceiver<Bytes>) {
+    fn new() -> (Arc<Self>, FlumeReceiver<Bytes>) {
         let (tx, rx) = bounded(16);
         (
             Arc::new(Self {
                 sink: Once::new(),
                 forwarded_tx: tx,
-                is_destination,
             }),
             rx,
         )
@@ -189,18 +189,16 @@ impl Cla for MockCla {
     ) -> ClaResult<ForwardBundleResult> {
         let bundle = buffer_stream(stream, total_len).await?;
         let _ = self.forwarded_tx.send(bundle);
-        if self.is_destination {
-            Ok(ForwardBundleResult::Sent)
-        } else {
-            Ok(ForwardBundleResult::Retained)
-        }
+        Ok(ForwardBundleResult::Sent)
     }
 }
 
 /// Routing Agent for Spray-and-Wait opportunistic routing.
 ///
-/// Pushes opportunistic `Via` routes during the Spray phase ($L > 1$), and
-/// refuses to install opportunistic routes once the Wait phase is reached ($L = 1$).
+/// Operates on the dedicated `SPRAY_TABLE`:
+/// - Installs a baseline fallback Jump to `TableId::DEFAULT` at priority 200.
+/// - Pushes opportunistic `Via` routes during the Spray phase ($L > 1$) at priority 100.
+/// - Refuses to install opportunistic routes once the Wait phase is reached ($L = 1$).
 struct SnwRoutingAgent {
     sink: Once<Box<dyn RoutingSink>>,
     updated_slots: Arc<Mutex<HashMap<BundleId, u32>>>,
@@ -238,18 +236,23 @@ impl SnwRoutingAgent {
 
         if let Some(sink) = self.sink.get() {
             let _ = sink
-                .add_route(target_pattern, RouteAction::Via(via_eid), 100)
+                .add_route_in_table(SPRAY_TABLE, target_pattern, RouteAction::Via(via_eid), 100)
                 .await;
             return true;
         }
         false
     }
 
-    /// Remove a previously installed spray route.
+    /// Remove a previously installed spray route from `SPRAY_TABLE`.
     async fn remove_spray_route(&self, target_pattern: &EidPattern, via_eid: &Eid) {
         if let Some(sink) = self.sink.get() {
             let _ = sink
-                .remove_route(target_pattern, &RouteAction::Via(via_eid.clone()), 100)
+                .remove_route_in_table(
+                    SPRAY_TABLE,
+                    target_pattern,
+                    &RouteAction::Via(via_eid.clone()),
+                    100,
+                )
                 .await;
         }
     }
@@ -258,6 +261,17 @@ impl SnwRoutingAgent {
 #[async_trait]
 impl RoutingAgent for SnwRoutingAgent {
     async fn on_register(&self, sink: Box<dyn RoutingSink>, _node_ids: &[NodeId]) {
+        // Fallback jump to default table at priority 200: enables direct delivery
+        // when opportunistic relaying is inactive (e.g. Wait phase or direct contact).
+        let all_pattern: EidPattern = "*:**".parse().unwrap();
+        let _ = sink
+            .add_route_in_table(
+                SPRAY_TABLE,
+                all_pattern,
+                RouteAction::Jump(TableId::DEFAULT),
+                200,
+            )
+            .await;
         self.sink.call_once(|| sink);
     }
 
@@ -314,7 +328,7 @@ async fn spray_and_wait_routing() {
     bpa.start(false).await;
 
     // 1. Ingress CLA: simulate sending a bundle with initial L = 4 to target node 99.
-    let (ingress_cla, _) = MockCla::new(false);
+    let (ingress_cla, _) = MockCla::new();
     bpa.register_cla(
         "cla_ingress".to_string(),
         ingress_cla.clone(),
@@ -353,7 +367,7 @@ async fn spray_and_wait_routing() {
     assert_eq!(acceptance, Acceptance::Accepted);
 
     // 2. First third-party station connects (node 2) via simulated CLA.
-    let (cla_station_1, station_1_rx) = MockCla::new(false);
+    let (cla_station_1, station_1_rx) = MockCla::new();
     bpa.register_cla(
         "cla_station_1".to_string(),
         cla_station_1.clone(),
@@ -415,7 +429,7 @@ async fn spray_and_wait_routing() {
         .await;
 
     // 3. Second third-party station connects (node 3) via simulated CLA.
-    let (cla_station_2, station_2_rx) = MockCla::new(false);
+    let (cla_station_2, station_2_rx) = MockCla::new();
     bpa.register_cla(
         "cla_station_2".to_string(),
         cla_station_2.clone(),
@@ -478,7 +492,7 @@ async fn spray_and_wait_routing() {
     // 4. A third BPA connects via a new CLA (node 4).
     // Opportunistic forwarding permits are now exhausted (Wait phase entered, L = 1).
     // It must receive nothing.
-    let (cla_station_3, station_3_rx) = MockCla::new(false);
+    let (cla_station_3, station_3_rx) = MockCla::new();
     bpa.register_cla(
         "cla_station_3".to_string(),
         cla_station_3.clone(),
@@ -511,7 +525,7 @@ async fn spray_and_wait_routing() {
     );
 
     // 5. Finally, the target destination BPA (node 99) connects via a simulated CLA.
-    let (cla_target, target_rx) = MockCla::new(true);
+    let (cla_target, target_rx) = MockCla::new();
     bpa.register_cla(
         "cla_target".to_string(),
         cla_target.clone(),

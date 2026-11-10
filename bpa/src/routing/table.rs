@@ -9,7 +9,7 @@ use tracing::trace;
 use tracing::instrument;
 
 use super::action::{Action, InternalAction, RouteAction};
-use super::{Error, Result};
+use super::{Error, Result, TableId};
 use crate::{
     Arc, BTreeMap, BTreeSet, HashSet, btree_map, node_ids::NodeIds, services::registry::Service,
 };
@@ -46,7 +46,9 @@ pub(super) enum LookupResult<'a> {
 
 #[derive(Clone)]
 pub struct RouteTable {
-    routes: BTreeMap<u32, BTreeMap<EidPattern, BTreeSet<Entry>>>,
+    pub(super) routes: BTreeMap<u32, BTreeMap<EidPattern, BTreeSet<Entry>>>,
+    pub(super) named_tables:
+        BTreeMap<TableId, BTreeMap<u32, BTreeMap<EidPattern, BTreeSet<Entry>>>>,
     node_ids: Arc<NodeIds>,
 }
 
@@ -71,11 +73,16 @@ impl RouteTable {
         let mut routes = BTreeMap::new();
         routes.insert(0, admin_endpoints);
 
-        Self { routes, node_ids }
+        Self {
+            routes,
+            named_tables: BTreeMap::new(),
+            node_ids,
+        }
     }
 
-    pub(super) fn insert(
+    pub(super) fn insert_in_table(
         &mut self,
+        table_id: TableId,
         pattern: EidPattern,
         entry: Entry,
         priority: u32,
@@ -89,9 +96,15 @@ impl RouteTable {
             }
         }
 
+        let table_routes = if table_id == TableId::DEFAULT {
+            &mut self.routes
+        } else {
+            self.named_tables.entry(table_id).or_default()
+        };
+
         let mut inserted = false;
         for pattern in pattern.into_atoms() {
-            match self.routes.entry(priority) {
+            match table_routes.entry(priority) {
                 btree_map::Entry::Vacant(e) => {
                     e.insert([(pattern, [entry.clone()].into())].into());
                     inserted = true;
@@ -112,23 +125,53 @@ impl RouteTable {
         Ok(inserted)
     }
 
-    pub(super) fn remove(&mut self, pattern: &EidPattern, entry: &Entry, priority: u32) -> bool {
+    #[cfg(test)]
+    pub(super) fn insert(
+        &mut self,
+        pattern: EidPattern,
+        entry: Entry,
+        priority: u32,
+    ) -> Result<bool> {
+        self.insert_in_table(TableId::DEFAULT, pattern, entry, priority)
+    }
+
+    pub(super) fn remove_in_table(
+        &mut self,
+        table_id: TableId,
+        pattern: &EidPattern,
+        entry: &Entry,
+        priority: u32,
+    ) -> bool {
+        let table_routes = if table_id == TableId::DEFAULT {
+            Some(&mut self.routes)
+        } else {
+            self.named_tables.get_mut(&table_id)
+        };
+        let Some(table_routes) = table_routes else {
+            return false;
+        };
+
         let mut removed = false;
         for pattern in pattern.clone().into_atoms() {
-            if let Some(patterns) = self.routes.get_mut(&priority)
+            if let Some(patterns) = table_routes.get_mut(&priority)
                 && let Some(actions) = patterns.get_mut(&pattern)
                 && actions.remove(entry)
             {
                 if actions.is_empty() {
                     patterns.remove(&pattern);
                     if patterns.is_empty() {
-                        self.routes.remove(&priority);
+                        table_routes.remove(&priority);
                     }
                 }
                 removed = true;
             }
         }
         removed
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove(&mut self, pattern: &EidPattern, entry: &Entry, priority: u32) -> bool {
+        self.remove_in_table(TableId::DEFAULT, pattern, entry, priority)
     }
 
     pub(super) fn remove_by_source(
@@ -167,6 +210,35 @@ impl RouteTable {
             !patterns.is_empty()
         });
 
+        for table_routes in self.named_tables.values_mut() {
+            table_routes.retain(|_priority, patterns| {
+                patterns.retain(|_pattern, actions| {
+                    actions.retain(|entry| {
+                        if entry.source == source {
+                            match &entry.action {
+                                Action::Route(RouteAction::Via(to)) => {
+                                    vias.insert(to.clone());
+                                }
+                                Action::Internal(InternalAction::Forward(peer)) => {
+                                    forward_peers.insert(*peer);
+                                }
+                                Action::Internal(InternalAction::Local(_)) => {
+                                    has_local = true;
+                                }
+                                _ => {}
+                            }
+                            removed_count += 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    !actions.is_empty()
+                });
+                !patterns.is_empty()
+            });
+        }
+
         (vias, forward_peers, has_local, removed_count)
     }
 
@@ -183,6 +255,19 @@ impl RouteTable {
                 }
             }
         }
+        for table_routes in self.named_tables.values() {
+            for (_, entry) in table_routes.range(priority..) {
+                for (p, actions) in entry {
+                    if p.is_subset(pattern) {
+                        for entry in actions {
+                            if let Action::Route(RouteAction::Via(to)) = &entry.action {
+                                vias.insert(to.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         vias
     }
 
@@ -193,10 +278,32 @@ impl RouteTable {
         reflect: bool,
         trail: &mut Trail<'a>,
     ) -> Option<LookupResult<'a>> {
-        trace!("Looking for route for {to}");
+        self.find_recurse_table(&TableId::DEFAULT, to, reflect, trail, &mut HashSet::new())
+    }
+
+    pub(super) fn find_recurse_table<'a>(
+        &'a self,
+        table_id: &TableId,
+        to: &'a Eid,
+        reflect: bool,
+        trail: &mut Trail<'a>,
+        visited_tables: &mut HashSet<TableId>,
+    ) -> Option<LookupResult<'a>> {
+        trace!("Looking for route for {to} in table {table_id:?}");
+
+        let table_routes = if *table_id == TableId::DEFAULT {
+            Some(&self.routes)
+        } else {
+            self.named_tables.get(table_id)
+        };
+
+        let Some(table_routes) = table_routes else {
+            trace!("Table {table_id:?} not found");
+            return None;
+        };
 
         let mut peers: PeerVec<'a> = SmallVec::new();
-        for entries in self.routes.values() {
+        for entries in table_routes.values() {
             for (pattern, actions) in entries {
                 if pattern.matches(to) {
                     for entry in actions {
@@ -211,6 +318,27 @@ impl RouteTable {
                                     return Some(LookupResult::Reflect);
                                 }
                             }
+                            Action::Route(RouteAction::Jump(target_table)) => {
+                                trace!("Jump to table {target_table:?}");
+                                if visited_tables.contains(target_table) {
+                                    trace!(
+                                        "Loop detected in inter-table jump for {target_table:?}"
+                                    );
+                                    continue;
+                                }
+                                visited_tables.insert(*target_table);
+                                let res = self.find_recurse_table(
+                                    target_table,
+                                    to,
+                                    reflect,
+                                    trail,
+                                    visited_tables,
+                                );
+                                visited_tables.remove(target_table);
+                                if let Some(res) = res {
+                                    return Some(res);
+                                }
+                            }
                             Action::Route(RouteAction::Via(via)) => {
                                 if trail.contains(&to) {
                                     trace!("Skipping recursive route for {to}");
@@ -218,7 +346,15 @@ impl RouteTable {
                                 }
                                 trail.push(to);
 
-                                let sub_result = self.find_recurse(via, reflect, trail);
+                                let mut via_visited = HashSet::new();
+                                via_visited.insert(*table_id);
+                                let sub_result = self.find_recurse_table(
+                                    table_id,
+                                    via,
+                                    reflect,
+                                    trail,
+                                    &mut via_visited,
+                                );
                                 trail.pop();
 
                                 // Carry each peer's resolved next-hop up unchanged: it is the

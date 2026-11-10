@@ -2,12 +2,13 @@ use core::{cmp::Ordering, fmt};
 
 use hardy_bpv7::{eid::Eid, status_report::ReasonCode};
 
-use crate::{Arc, services::registry::Service};
+use crate::{Arc, routing::TableId, services::registry::Service};
 
 /// What routing agents configure. Validated on insert into the route table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RouteAction {
     Via(Eid),
+    Jump(TableId),
     Reflect,
     Drop(Option<ReasonCode>),
 }
@@ -18,6 +19,7 @@ impl fmt::Display for RouteAction {
             RouteAction::Drop(Some(reason)) => write!(f, "Drop({reason:?})"),
             RouteAction::Drop(None) => write!(f, "Drop"),
             RouteAction::Reflect => write!(f, "Reflect"),
+            RouteAction::Jump(table) => write!(f, "Jump to table {}", table.raw()),
             RouteAction::Via(eid) => write!(f, "Via {eid}"),
         }
     }
@@ -35,7 +37,8 @@ impl Ord for RouteAction {
             match a {
                 RouteAction::Drop(_) => 0,
                 RouteAction::Reflect => 1,
-                RouteAction::Via(_) => 2,
+                RouteAction::Jump(_) => 2,
+                RouteAction::Via(_) => 3,
             }
         };
         match rank(self).cmp(&rank(other)) {
@@ -44,6 +47,7 @@ impl Ord for RouteAction {
         }
         match (self, other) {
             (RouteAction::Drop(a), RouteAction::Drop(b)) => a.cmp(b),
+            (RouteAction::Jump(a), RouteAction::Jump(b)) => a.cmp(b),
             (RouteAction::Via(a), RouteAction::Via(b)) => a.cmp(b),
             _ => Ordering::Equal,
         }
@@ -125,7 +129,7 @@ impl PartialOrd for Action {
 
 impl Ord for Action {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Drop < AdminEndpoint < Local < Forward < Reflect < Via
+        // Drop < AdminEndpoint < Local < Forward < Reflect < Jump < Via
         let rank = |a: &Action| -> u8 {
             match a {
                 Action::Route(RouteAction::Drop(_)) => 0,
@@ -133,7 +137,8 @@ impl Ord for Action {
                 Action::Internal(InternalAction::Local(_)) => 2,
                 Action::Internal(InternalAction::Forward(_)) => 3,
                 Action::Route(RouteAction::Reflect) => 4,
-                Action::Route(RouteAction::Via(_)) => 5,
+                Action::Route(RouteAction::Jump(_)) => 5,
+                Action::Route(RouteAction::Via(_)) => 6,
             }
         };
         match rank(self).cmp(&rank(other)) {

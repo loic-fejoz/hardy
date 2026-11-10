@@ -7,7 +7,7 @@ use hardy_bpv7::eid::{Eid, NodeId};
 use hardy_eid_patterns::EidPattern;
 use thiserror::Error;
 
-use super::action::RouteAction;
+use super::{TableId, action::RouteAction};
 use crate::async_trait;
 
 /// A specialized `Result` type for routing agent operations.
@@ -103,7 +103,7 @@ pub trait RoutingSink: Send + Sync {
     /// [`RoutingAgent::on_unregister`] and all routes from this agent are removed.
     async fn unregister(&self);
 
-    /// Adds a route to the RIB.
+    /// Adds a route to the default routing table in the RIB.
     ///
     /// Returns `true` if the route was newly inserted, `false` if it already existed.
     async fn add_route(
@@ -111,9 +111,23 @@ pub trait RoutingSink: Send + Sync {
         pattern: EidPattern,
         action: RouteAction,
         priority: u32,
+    ) -> Result<bool> {
+        self.add_route_in_table(TableId::DEFAULT, pattern, action, priority)
+            .await
+    }
+
+    /// Adds a route to a specific routing table in the RIB.
+    ///
+    /// Returns `true` if the route was newly inserted, `false` if it already existed.
+    async fn add_route_in_table(
+        &self,
+        table: TableId,
+        pattern: EidPattern,
+        action: RouteAction,
+        priority: u32,
     ) -> Result<bool>;
 
-    /// Removes a specific route from the RIB.
+    /// Removes a specific route from the default routing table in the RIB.
     ///
     /// Only removes routes that match all three fields (pattern, action, priority)
     /// and this agent's source name.
@@ -121,6 +135,23 @@ pub trait RoutingSink: Send + Sync {
     /// Returns `true` if the route was found and removed.
     async fn remove_route(
         &self,
+        pattern: &EidPattern,
+        action: &RouteAction,
+        priority: u32,
+    ) -> Result<bool> {
+        self.remove_route_in_table(TableId::DEFAULT, pattern, action, priority)
+            .await
+    }
+
+    /// Removes a specific route from a routing table in the RIB.
+    ///
+    /// Only removes routes that match all three fields (pattern, action, priority)
+    /// and this agent's source name.
+    ///
+    /// Returns `true` if the route was found and removed.
+    async fn remove_route_in_table(
+        &self,
+        table: TableId,
         pattern: &EidPattern,
         action: &RouteAction,
         priority: u32,

@@ -136,11 +136,16 @@ impl Dispatcher {
             .forward(lane, cla_addr, bundle.id(), total_len, &mut data)
             .await
         {
-            Ok(cla::ForwardBundleResult::Sent) => OfferOutcome::Completed(bundle),
-            Ok(cla::ForwardBundleResult::Retained) => {
-                metrics::counter!("bpa.bundle.forwarded").increment(1);
-                self.report_bundle_forwarded(&bundle).await;
-                OfferOutcome::Parked(bundle, bundle::BundleStatus::Waiting, seen)
+            Ok(cla::ForwardBundleResult::Sent) => {
+                let is_relay_forward = bundle.metadata.route_table().is_some()
+                    && bundle.primary().destination != next_hop;
+                if is_relay_forward {
+                    metrics::counter!("bpa.bundle.forwarded").increment(1);
+                    self.report_bundle_forwarded(&bundle).await;
+                    OfferOutcome::Parked(bundle, bundle::BundleStatus::Waiting, seen)
+                } else {
+                    OfferOutcome::Completed(bundle)
+                }
             }
             Ok(cla::ForwardBundleResult::Accepted) => {
                 // The CLA owns the transfer; the bundle stays in
@@ -223,16 +228,6 @@ impl Dispatcher {
             cla::TransferOutcome::Completed => {
                 self.resolve_offer(OfferKind::Forward, OfferOutcome::Completed(bundle))
                     .await
-            }
-            cla::TransferOutcome::Retained => {
-                metrics::counter!("bpa.bundle.forwarded").increment(1);
-                self.report_bundle_forwarded(&bundle).await;
-                let seen = self.rib.table_snapshot();
-                self.resolve_offer(
-                    OfferKind::Forward,
-                    OfferOutcome::Parked(bundle, bundle::BundleStatus::Waiting, seen),
-                )
-                .await
             }
             cla::TransferOutcome::Failed => {
                 if !self

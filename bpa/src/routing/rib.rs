@@ -290,20 +290,16 @@ impl Rib {
         // The lookup inputs are the record's own: the {table, key} the
         // Classifier chain derived, destination-in-default-table when unset.
         let key = bundle.metadata.routing_key();
+        let target_table = key.table.as_ref().unwrap_or(&TableId::DEFAULT);
 
-        // Only the default table exists until the tables tranche: a lookup
-        // naming any other table is a strict no-match, and the bundle Waits
-        // for its topology rather than leaking onto this one. An explicit
-        // default is the default — the same normalisation as the key.
-        if let Some(table_id) = key.unknown_table() {
-            debug!("Lookup names unknown table {table_id:?}: no match");
-            return None;
-        }
-
-        let result = table.find_recurse(
+        let mut visited_tables = HashSet::new();
+        visited_tables.insert(*target_table);
+        let result = table.find_recurse_table(
+            target_table,
             key.lookup_eid(&bundle.primary().destination),
             true,
             &mut Trail::new(),
+            &mut visited_tables,
         )?;
 
         let previous;
@@ -311,7 +307,15 @@ impl Rib {
             previous = bundle
                 .previous_node()
                 .unwrap_or_else(|| bundle.id().source.clone());
-            table.find_recurse(&previous, false, &mut Trail::new())?
+            let mut visited_tables = HashSet::new();
+            visited_tables.insert(*target_table);
+            table.find_recurse_table(
+                target_table,
+                &previous,
+                false,
+                &mut Trail::new(),
+                &mut visited_tables,
+            )?
         } else {
             result
         };
@@ -386,8 +390,9 @@ impl Rib {
         })
     }
 
-    pub(crate) async fn add(
+    pub(crate) async fn add_in_table(
         &self,
+        table_id: TableId,
         pattern: EidPattern,
         source: String,
         action: Action,
@@ -406,14 +411,16 @@ impl Rib {
                 action: action.clone(),
                 source: source.clone(),
             };
-            if !table.insert(pattern.clone(), entry, priority)? {
+            if !table.insert_in_table(table_id, pattern.clone(), entry, priority)? {
                 return Ok(false);
             }
 
             let vias = table.impacted_vias(&pattern, priority);
             self.snapshot.store(Arc::new(table.clone()));
 
-            debug!("Adding route {pattern} => {action}, priority {priority}, source '{source}'");
+            debug!(
+                "Adding route in table {table_id:?} {pattern} => {action}, priority {priority}, source '{source}'"
+            );
             metrics::gauge!("bpa.rib.entries", "source" => source).increment(1.0);
 
             vias
@@ -436,8 +443,20 @@ impl Rib {
         Ok(true)
     }
 
-    pub(crate) async fn remove(
+    pub(crate) async fn add(
         &self,
+        pattern: EidPattern,
+        source: String,
+        action: Action,
+        priority: u32,
+    ) -> Result<bool> {
+        self.add_in_table(TableId::DEFAULT, pattern, source, action, priority)
+            .await
+    }
+
+    pub(crate) async fn remove_in_table(
+        &self,
+        table_id: TableId,
         pattern: &EidPattern,
         source: &str,
         action: Action,
@@ -453,14 +472,16 @@ impl Rib {
                 action: action.clone(),
                 source: source.to_string(),
             };
-            if !table.remove(&pattern, &entry, priority) {
+            if !table.remove_in_table(table_id, &pattern, &entry, priority) {
                 return false;
             }
 
             self.snapshot.store(Arc::new(table.clone()));
         }
 
-        debug!("Removed route {pattern} => {action}, priority {priority}, source '{source}'");
+        debug!(
+            "Removed route from table {table_id:?} {pattern} => {action}, priority {priority}, source '{source}'"
+        );
         metrics::gauge!("bpa.rib.entries", "source" => source.to_string()).decrement(1.0);
 
         match action {
@@ -492,7 +513,19 @@ impl Rib {
             }
             _ => {}
         }
+
         true
+    }
+
+    pub(crate) async fn remove(
+        &self,
+        pattern: &EidPattern,
+        source: &str,
+        action: Action,
+        priority: u32,
+    ) -> bool {
+        self.remove_in_table(TableId::DEFAULT, pattern, source, action, priority)
+            .await
     }
 
     pub async fn remove_by_source(&self, source: &str) {

@@ -22,7 +22,7 @@ pub(crate) use self::rib::{Decision, DispatchAction, Rib, RibSnapshot, RoutingKe
 /// creates them, is an open question of the tables design
 /// (`docs/routing_table_redesign.md`, "Open questions"); this type is where
 /// the answer lands.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct TableId(u32);
 
@@ -30,9 +30,13 @@ impl TableId {
     /// The default table: the one an unset `route_table` selects.
     pub const DEFAULT: Self = Self(0);
 
-    /// A table by numeric id, for the crate's tests.
-    #[cfg(test)]
-    pub(crate) const fn new(id: u32) -> Self {
+    /// A table by numeric id.
+    pub const fn new(id: u32) -> Self {
         Self(id)
+    }
+
+    /// The raw numeric table id.
+    pub const fn raw(&self) -> u32 {
+        self.0
     }
 }

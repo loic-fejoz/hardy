@@ -186,9 +186,6 @@ pub enum ForwardBundleResult {
     /// reported — the terminal, fire-and-forget answer of an unreliable
     /// convergence layer.
     Sent,
-    /// The bundle was successfully sent, but should be retained by the BPA
-    /// (e.g. for multi-copy opportunistic routing).
-    Retained,
     /// The CLA has taken ownership of the bundle and will report the
     /// transfer's outcome later via [`Sink::transfer_outcome`]. The BPA
     /// retains the bundle until the outcome arrives or the peer is removed;
@@ -211,9 +208,6 @@ pub enum ForwardBundleResult {
 pub enum TransferOutcome {
     /// The bundle was handed to the far bundle node.
     Completed,
-    /// The bundle was handed to the far bundle node, but should be retained
-    /// locally by the BPA.
-    Retained,
     /// The convergence layer gave up on the transfer.
     ///
     /// Not proof of non-delivery: the far end may already hold the bundle
