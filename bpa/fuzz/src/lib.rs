@@ -150,7 +150,7 @@ impl Msg {
                     Arc::new(hardy_bpa::routing::StaticRoutingAgent::new(&[
                         (
                             "ipn:*.*".parse().unwrap(),
-                            hardy_bpa::routing::RouteAction::Via("ipn:0.2.0".parse().unwrap()),
+                            hardy_bpa::routing::RouteAction::Via("ipn:0.2.0".parse().unwrap(), false),
                             30,
                         ),
                         (

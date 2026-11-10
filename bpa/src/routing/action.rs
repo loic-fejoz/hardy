@@ -7,7 +7,7 @@ use crate::{Arc, services::registry::Service};
 /// What routing agents configure. Validated on insert into the route table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RouteAction {
-    Via(Eid),
+    Via(Eid, bool),
     Reflect,
     Drop(Option<ReasonCode>),
 }
@@ -18,7 +18,8 @@ impl fmt::Display for RouteAction {
             RouteAction::Drop(Some(reason)) => write!(f, "Drop({reason:?})"),
             RouteAction::Drop(None) => write!(f, "Drop"),
             RouteAction::Reflect => write!(f, "Reflect"),
-            RouteAction::Via(eid) => write!(f, "Via {eid}"),
+            RouteAction::Via(eid, false) => write!(f, "Via {eid}"),
+            RouteAction::Via(eid, true) => write!(f, "Via {eid} (retain)"),
         }
     }
 }
@@ -35,7 +36,7 @@ impl Ord for RouteAction {
             match a {
                 RouteAction::Drop(_) => 0,
                 RouteAction::Reflect => 1,
-                RouteAction::Via(_) => 2,
+                RouteAction::Via(..) => 2,
             }
         };
         match rank(self).cmp(&rank(other)) {
@@ -44,7 +45,9 @@ impl Ord for RouteAction {
         }
         match (self, other) {
             (RouteAction::Drop(a), RouteAction::Drop(b)) => a.cmp(b),
-            (RouteAction::Via(a), RouteAction::Via(b)) => a.cmp(b),
+            (RouteAction::Via(a_eid, a_retain), RouteAction::Via(b_eid, b_retain)) => {
+                a_eid.cmp(b_eid).then_with(|| a_retain.cmp(b_retain))
+            }
             _ => Ordering::Equal,
         }
     }
@@ -133,7 +136,7 @@ impl Ord for Action {
                 Action::Internal(InternalAction::Local(_)) => 2,
                 Action::Internal(InternalAction::Forward(_)) => 3,
                 Action::Route(RouteAction::Reflect) => 4,
-                Action::Route(RouteAction::Via(_)) => 5,
+                Action::Route(RouteAction::Via(..)) => 5,
             }
         };
         match rank(self).cmp(&rank(other)) {

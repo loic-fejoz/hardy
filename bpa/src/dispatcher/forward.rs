@@ -33,6 +33,11 @@ impl Dispatcher {
         // re-check it to close the park-vs-poll window (see park_bundle).
         let seen = self.rib.table_snapshot();
 
+        let retain = match self.rib.decide(&bundle).action {
+            Some(routing::DispatchAction::Forward { retain, .. }) => retain,
+            _ => false,
+        };
+
         // A transfer commits at the claim below — the reaper defers an
         // in-flight hand-off — so never commence one for a bundle that has
         // already expired: resolve it as the reaper would.
@@ -66,8 +71,10 @@ impl Dispatcher {
         // claim's resolution.
         self.resolve_offer(
             OfferKind::Forward,
-            self.offer_to_cla(cla, peer, lane, cla_addr, next_hop, bundle, data, seen)
-                .await,
+            self.offer_to_cla(
+                cla, peer, lane, cla_addr, next_hop, bundle, data, seen, retain,
+            )
+            .await,
         )
         .await
     }
@@ -86,6 +93,7 @@ impl Dispatcher {
         mut bundle: bundle::Bundle,
         data: Bytes,
         seen: routing::RibSnapshot,
+        retain: bool,
     ) -> OfferOutcome {
         // The §E removals the ingress gate deferred apply first, so the
         // Rewriters see the bundle as it will travel, and the strip can never
@@ -136,7 +144,15 @@ impl Dispatcher {
             .forward(lane, cla_addr, bundle.id(), total_len, &mut data)
             .await
         {
-            Ok(cla::ForwardBundleResult::Sent) => OfferOutcome::Completed(bundle),
+            Ok(cla::ForwardBundleResult::Sent) => {
+                if retain {
+                    metrics::counter!("bpa.bundle.forwarded").increment(1);
+                    self.report_bundle_forwarded(&bundle).await;
+                    OfferOutcome::Parked(bundle, bundle::BundleStatus::Waiting, seen)
+                } else {
+                    OfferOutcome::Completed(bundle)
+                }
+            }
             Ok(cla::ForwardBundleResult::Accepted) => {
                 // The CLA owns the transfer; the bundle stays in
                 // ForwardAckPending until the outcome arrives or the peer is

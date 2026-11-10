@@ -18,7 +18,7 @@ use crate::{async_trait, routing::action::RouteAction};
 /// use hardy_bpa::routing::{StaticRoutingAgent, RouteAction};
 ///
 /// let agent = Arc::new(StaticRoutingAgent::new(&[
-///     ("ipn:*.*".parse().unwrap(), RouteAction::Via("ipn:0.2.0".parse().unwrap()), 30),
+///     ("ipn:*.*".parse().unwrap(), RouteAction::Via("ipn:0.2.0".parse().unwrap(), false), 30),
 ///     ("dtn://drop/**".parse().unwrap(), RouteAction::Drop(None), 50),
 /// ]));
 /// bpa.register_routing_agent("my_routes".to_string(), agent).await?;

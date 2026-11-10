@@ -73,7 +73,7 @@ fn via_action<'a>() -> impl Parser<'a, &'a str, RouteAction, Extra<'a>> {
                 })
                 .labelled("next-hop EID"),
         )
-        .map(RouteAction::Via)
+        .map(|eid| RouteAction::Via(eid, false))
         .labelled("via action")
 }
 
@@ -257,7 +257,7 @@ mod test {
     fn simple_route() {
         let routes = parse_ok("ipn:*.*.* via ipn:0.1.0");
         assert_eq!(routes.len(), 1);
-        assert!(matches!(routes[0].action, RouteAction::Via(_)));
+        assert!(matches!(routes[0].action, RouteAction::Via(..)));
         assert_eq!(routes[0].priority, None);
     }
 
@@ -303,7 +303,7 @@ mod test {
     fn via_with_priority() {
         let routes = parse_ok("ipn:*.*.* via ipn:0.1.0 priority 42");
         assert_eq!(routes.len(), 1);
-        assert!(matches!(routes[0].action, RouteAction::Via(_)));
+        assert!(matches!(routes[0].action, RouteAction::Via(..)));
         assert_eq!(routes[0].priority, Some(42));
     }
 
@@ -311,7 +311,7 @@ mod test {
     fn case_insensitive_keywords() {
         // All-caps
         let routes = parse_ok("ipn:*.*.* VIA ipn:0.1.0");
-        assert!(matches!(routes[0].action, RouteAction::Via(_)));
+        assert!(matches!(routes[0].action, RouteAction::Via(..)));
 
         let routes = parse_ok("ipn:99.*.* DROP");
         assert!(matches!(routes[0].action, RouteAction::Drop(None)));
@@ -324,7 +324,7 @@ mod test {
 
         // Mixed case
         let routes = parse_ok("ipn:*.*.* Via ipn:0.1.0");
-        assert!(matches!(routes[0].action, RouteAction::Via(_)));
+        assert!(matches!(routes[0].action, RouteAction::Via(..)));
 
         let routes = parse_ok("ipn:99.*.* Drop 3 Priority 5");
         assert!(matches!(routes[0].action, RouteAction::Drop(Some(_))));

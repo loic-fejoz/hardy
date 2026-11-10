@@ -293,7 +293,7 @@ pub mod routing {
                     let eid = eid.parse().map_err(|e| {
                         tonic::Status::invalid_argument(format!("Invalid EID: {e}"))
                     })?;
-                    Ok(hardy_bpa::routing::RouteAction::Via(eid))
+                    Ok(hardy_bpa::routing::RouteAction::Via(eid, false))
                 }
             }
         }
@@ -311,7 +311,7 @@ pub mod routing {
                 hardy_bpa::routing::RouteAction::Reflect => RouteAction {
                     action: Some(route_action::Action::Reflect(ReflectAction {})),
                 },
-                hardy_bpa::routing::RouteAction::Via(eid) => RouteAction {
+                hardy_bpa::routing::RouteAction::Via(eid, _) => RouteAction {
                     action: Some(route_action::Action::Via(eid.to_string())),
                 },
             }

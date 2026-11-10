@@ -141,7 +141,7 @@ async fn exec_builtin_cla(
             "ping-target".to_string(),
             alloc::sync::Arc::new(hardy_bpa::routing::StaticRoutingAgent::new(&[(
                 args.destination.clone().into(),
-                hardy_bpa::routing::RouteAction::Via(peer.into()),
+                hardy_bpa::routing::RouteAction::Via(peer.into(), false),
                 1,
             )])),
         )
@@ -230,7 +230,7 @@ async fn exec_external_cla(
             "ping-target".to_string(),
             alloc::sync::Arc::new(hardy_bpa::routing::StaticRoutingAgent::new(&[(
                 args.destination.clone().into(),
-                hardy_bpa::routing::RouteAction::Via(peer.into()),
+                hardy_bpa::routing::RouteAction::Via(peer.into(), false),
                 1,
             )])),
         )

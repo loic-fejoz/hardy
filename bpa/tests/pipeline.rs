@@ -5087,8 +5087,8 @@ async fn a_route_changed_during_the_drain_is_decided_again() {
         .await
         .unwrap();
     let routes = agent.sink.get().unwrap();
-    let old_via = RouteAction::Via("ipn:0.2.0".parse().unwrap());
-    let new_via = RouteAction::Via("ipn:0.4.0".parse().unwrap());
+    let old_via = RouteAction::Via("ipn:0.2.0".parse().unwrap(), false);
+    let new_via = RouteAction::Via("ipn:0.4.0".parse().unwrap(), false);
     assert!(
         routes
             .add_route("ipn:0.3.*".parse().unwrap(), old_via.clone(), 1)

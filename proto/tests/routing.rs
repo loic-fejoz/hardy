@@ -98,7 +98,7 @@ async fn rte_cli_02_add_route() {
     let sink = agent.take_sink().expect("agent should have a sink");
 
     let pattern = "ipn:2.*.*".parse().expect("valid pattern");
-    let action = RouteAction::Via("ipn:2.1.0".parse().expect("valid EID"));
+    let action = RouteAction::Via("ipn:2.1.0".parse().expect("valid EID"), false);
     let added = sink
         .add_route(pattern, action, 100)
         .await
@@ -132,7 +132,7 @@ async fn rte_cli_03_remove_route() {
     let sink = agent.take_sink().expect("agent should have a sink");
 
     let pattern = "ipn:2.*.*".parse().expect("valid pattern");
-    let action = RouteAction::Via("ipn:2.1.0".parse().expect("valid EID"));
+    let action = RouteAction::Via("ipn:2.1.0".parse().expect("valid EID"), false);
     let removed = sink
         .remove_route(&pattern, &action, 100)
         .await

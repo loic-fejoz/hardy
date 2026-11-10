@@ -188,7 +188,7 @@ impl Dispatcher {
                     }
                 }
             }
-            Some(routing::DispatchAction::Forward { peer, next_hop }) => {
+            Some(routing::DispatchAction::Forward { peer, next_hop, .. }) => {
                 debug!("Queuing bundle for forwarding to CLA peer {peer}");
                 if let Err(bundle) = cla_registry.forward(peer, next_hop, bundle).await {
                     // The peer vanished between the RIB lookup and the

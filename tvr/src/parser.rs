@@ -78,7 +78,7 @@ fn via_action<'a>() -> impl Parser<'a, &'a str, RouteAction, Extra<'a>> {
                 })
                 .labelled("next-hop EID"),
         )
-        .map(RouteAction::Via)
+        .map(|eid| RouteAction::Via(eid, false))
         .labelled("via action")
 }
 
@@ -557,7 +557,7 @@ mod test {
     fn simple_via() {
         let c = parse_ok("ipn:*.*.* via ipn:0.1.0");
         assert_eq!(c.len(), 1);
-        assert!(matches!(c[0].action, RouteAction::Via(_)));
+        assert!(matches!(c[0].action, RouteAction::Via(..)));
         assert_eq!(c[0].priority, None);
         assert_eq!(c[0].schedule, Schedule::Permanent);
     }
@@ -581,7 +581,7 @@ mod test {
     fn via_with_priority() {
         let c = parse_ok("ipn:2.*.* via ipn:2.1.0 priority 10");
         assert_eq!(c.len(), 1);
-        assert!(matches!(c[0].action, RouteAction::Via(_)));
+        assert!(matches!(c[0].action, RouteAction::Via(..)));
         assert_eq!(c[0].priority, Some(10));
         assert_eq!(c[0].schedule, Schedule::Permanent);
     }

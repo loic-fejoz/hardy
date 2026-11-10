@@ -117,6 +117,8 @@ pub enum DispatchAction {
         /// The adjacency EID whose forward entry the lookup matched —
         /// carried into the peer queue's assignment record.
         next_hop: Eid,
+        /// Whether the bundle should be retained in storage after forwarding.
+        retain: bool,
     },
     Drop(Option<ReasonCode>),
 }
@@ -320,9 +322,10 @@ impl Rib {
             LookupResult::AdminEndpoint => Some(DispatchAction::AdminEndpoint),
             LookupResult::Deliver(service) => Some(DispatchAction::Deliver(service)),
             LookupResult::Drop(reason) => Some(DispatchAction::Drop(reason)),
-            LookupResult::Forward(peer, next_hop) => Some(DispatchAction::Forward {
+            LookupResult::Forward(peer, next_hop, retain) => Some(DispatchAction::Forward {
                 peer,
                 next_hop: next_hop.clone(),
+                retain,
             }),
             LookupResult::ForwardEcmp(peers) => self.select_peer(peers, &bundle.bpv7),
             LookupResult::Reflect => None,
@@ -354,7 +357,7 @@ impl Rib {
 
     fn select_peer(
         &self,
-        mut peers: Vec<(u32, &Eid)>,
+        mut peers: Vec<(u32, &Eid, bool)>,
         bundle: &Bpv7Bundle,
     ) -> Option<DispatchAction> {
         if peers.is_empty() {
@@ -379,10 +382,11 @@ impl Rib {
         } else {
             0
         };
-        let (peer, next_hop) = peers.swap_remove(idx);
+        let (peer, next_hop, retain) = peers.swap_remove(idx);
         Some(DispatchAction::Forward {
             peer,
             next_hop: next_hop.clone(),
+            retain,
         })
     }
 
@@ -464,7 +468,7 @@ impl Rib {
         metrics::gauge!("bpa.rib.entries", "source" => source.to_string()).decrement(1.0);
 
         match action {
-            Action::Route(RouteAction::Via(ref to)) => {
+            Action::Route(RouteAction::Via(ref to, _)) => {
                 if let Some(peers) = self.find_peers(to)
                     && self.reset_peer_queues(peers).await
                 {
@@ -652,8 +656,9 @@ impl Rib {
 
     fn expand_action(&self, action: Action) -> Action {
         match action {
-            Action::Route(RouteAction::Via(eid)) => Action::Route(RouteAction::Via(
+            Action::Route(RouteAction::Via(eid, retain)) => Action::Route(RouteAction::Via(
                 self.node_ids.expand_local_node(&eid).unwrap_or(eid),
+                retain,
             )),
             other => other,
         }
@@ -788,7 +793,7 @@ mod tests {
             &rib,
             "ipn:0.50.*",
             "default",
-            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap(), false)),
             1000,
         );
         add_local_forward(&rib, ipn_node(10), 99);
@@ -811,20 +816,22 @@ mod tests {
             &rib,
             "ipn:0.50.*",
             "chain",
-            Action::Route(RouteAction::Via("ipn:0.40.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.40.0".parse().unwrap(), false)),
             10,
         );
         add_route(
             &rib,
             "ipn:0.40.*",
             "chain",
-            Action::Route(RouteAction::Via("ipn:0.3.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.3.0".parse().unwrap(), false)),
             10,
         );
         add_local_forward(&rib, ipn_node(3), 77);
 
         let bundle = make_bundle("ipn:0.50.1");
-        let Some(DispatchAction::Forward { peer: 77, next_hop }) = rib.decide(&bundle).action
+        let Some(DispatchAction::Forward {
+            peer: 77, next_hop, ..
+        }) = rib.decide(&bundle).action
         else {
             panic!("Via chain must resolve to the adjacent neighbour's peer");
         };
@@ -850,14 +857,14 @@ mod tests {
             &rib,
             "ipn:0.2.*",
             "loop",
-            Action::Route(RouteAction::Via("ipn:0.3.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.3.0".parse().unwrap(), false)),
             10,
         );
         add_route(
             &rib,
             "ipn:0.3.*",
             "loop",
-            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap(), false)),
             10,
         );
 
@@ -921,14 +928,14 @@ mod tests {
             &rib,
             "ipn:0.50.*",
             "ecmp_a",
-            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap(), false)),
             10,
         );
         add_route(
             &rib,
             "ipn:0.50.*",
             "ecmp_b",
-            Action::Route(RouteAction::Via("ipn:0.11.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.11.0".parse().unwrap(), false)),
             10,
         );
         add_local_forward(&rib, ipn_node(10), 10);
@@ -963,14 +970,14 @@ mod tests {
             &rib,
             "ipn:0.50.*",
             "ecmp_a",
-            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.10.0".parse().unwrap(), false)),
             10,
         );
         add_route(
             &rib,
             "ipn:0.50.*",
             "ecmp_b",
-            Action::Route(RouteAction::Via("ipn:0.11.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.11.0".parse().unwrap(), false)),
             10,
         );
         add_local_forward(&rib, ipn_node(10), 10);
@@ -1200,7 +1207,7 @@ mod tests {
             .add(
                 "ipn:0.2.*".parse().unwrap(),
                 "test".into(),
-                Action::Route(RouteAction::Via(Eid::Null)),
+                Action::Route(RouteAction::Via(Eid::Null, false)),
                 10,
             )
             .await;
@@ -1217,7 +1224,7 @@ mod tests {
             .add(
                 "ipn:0.99.*".parse().unwrap(),
                 "test".into(),
-                Action::Route(RouteAction::Via("ipn:0.1.0".parse().unwrap())),
+                Action::Route(RouteAction::Via("ipn:0.1.0".parse().unwrap(), false)),
                 10,
             )
             .await;
@@ -1234,7 +1241,7 @@ mod tests {
             .add(
                 "*:**".parse().unwrap(),
                 "test".into(),
-                Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+                Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap(), false)),
                 10,
             )
             .await;
@@ -1258,7 +1265,7 @@ mod tests {
         rib.add(
             "ipn:0.7.*".parse().unwrap(),
             "test".into(),
-            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap())),
+            Action::Route(RouteAction::Via("ipn:0.2.0".parse().unwrap(), false)),
             10,
         )
         .await

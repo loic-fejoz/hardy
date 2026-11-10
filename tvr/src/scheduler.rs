@@ -806,7 +806,7 @@ mod test {
     }
 
     fn via(next_hop: &str) -> RouteAction {
-        RouteAction::Via(next_hop.parse().unwrap())
+        RouteAction::Via(next_hop.parse().unwrap(), false)
     }
 
     fn pat(s: &str) -> EidPattern {

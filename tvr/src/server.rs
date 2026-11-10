@@ -55,7 +55,7 @@ fn convert_contact(proto: proto::tvr::Contact) -> Result<Contact, tonic::Status>
             let eid = eid.parse().map_err(|e| {
                 tonic::Status::invalid_argument(format!("invalid next-hop EID: {e}"))
             })?;
-            RouteAction::Via(eid)
+            RouteAction::Via(eid, false)
         }
         Some(contact::Action::Drop(drop_action)) => {
             let reason = if drop_action.reason_code == 0 {
@@ -504,7 +504,7 @@ mod test {
     #[test]
     fn contact_valid_via() {
         let c = convert_contact(proto_contact_via("ipn:2.*.*", "ipn:2.1.0")).unwrap();
-        assert!(matches!(c.action, RouteAction::Via(_)));
+        assert!(matches!(c.action, RouteAction::Via(..)));
         assert!(matches!(c.schedule, Schedule::Permanent));
     }
 
